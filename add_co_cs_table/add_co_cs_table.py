@@ -2,7 +2,8 @@ import os
 from ast import literal_eval
 
 import pyspark.sql.functions as sf
-from colabfit.tools.schema import co_cs_mapping_schema
+
+# from colabfit.tools.schema import co_cs_mapping_schema
 from dotenv import load_dotenv
 from pyspark.sql import SparkSession
 from pyspark.sql.types import ArrayType, StringType
@@ -37,7 +38,7 @@ cs_co = (
     .withColumnRenamed("id", "configuration_id")
 )
 cs_co.show(5, False)
-cs_co_table_name = "ndb.colabfit.dev.cs_co_wip"
+cs_co_table_name = "ndb.colabfit.dev.cs_co_map_wip"
 cs_co.write.mode("overwrite").saveAsTable(cs_co_table_name)
 
 

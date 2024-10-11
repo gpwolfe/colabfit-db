@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=ds_to_prod
+#SBATCH --job-name=ds_dev_copy
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=160GB
