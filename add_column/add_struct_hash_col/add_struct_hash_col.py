@@ -32,7 +32,7 @@ spark = SparkSession.builder.appName("copy_to_dev").getOrCreate()
 begin = time()
 
 co_table = "ndb.colabfit.dev.co_wip"
-to_co_table = "ndb.colabfit.dev.co_with_struct_hash_int"
+to_co_table = "ndb.colabfit.dev.co_with_struct_hash_long_str"
 
 
 print("loading cos")
@@ -72,7 +72,7 @@ config_df_schema = StructType(
 config_schema = get_stringified_schema(config_df_schema)
 
 
-@sf.udf(returnType=IntegerType())
+@sf.udf(returnType=StringType())
 def config_struct_hash_udf(atomic_numbers, cell, pbc, *positions_cols):
     """
     Will hash in the following order: atomic_numbers, cell, pbc, positions
@@ -103,7 +103,7 @@ def config_struct_hash_udf(atomic_numbers, cell, pbc, *positions_cols):
     _hash.update(bytes(_format_for_hash(literal_eval(cell))))
     _hash.update(bytes(_format_for_hash(literal_eval(pbc))))
     _hash.update(bytes(_format_for_hash(sorted_positions)))
-    return int(_hash.hexdigest(), 16)
+    return str(int(_hash.hexdigest(), 16))
 
 
 cos = cos.withColumn(
