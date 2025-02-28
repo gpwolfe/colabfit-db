@@ -1,7 +1,8 @@
 # ColabFit-DB
-Some of the scripts contained in the subdirectories here are used regularly to manage database updates.<br>  
-Other scripts are used to fix errors that may crop up during ingest, or else provide templates to edit the database in some way, such as adding or removing columns.<br>  
-Finally, some scripts were used to fix one-off errors or manage one-time changes to the database. These are provided as a record of changes and as templates in case of similar future changes.
+## Scripts and templates related to managing the ColabFit Exchange database
+The [ColabFit Exchange](https://www.colabfit.org) is a database of collected datasets created with the intent to provide data for the training of machine-learning interatomic potentials (MLIP) or data-driven interatomic potentials (DDIP).
+
+## Contents
 
 ### db_management
 Contains scripts used more or less regularly to update the production database, get statistics or analyze database contents, and work with the development tables.
