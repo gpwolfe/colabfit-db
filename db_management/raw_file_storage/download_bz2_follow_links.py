@@ -3,6 +3,28 @@ import sys
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+from multiprocessing import Pool
+
+
+def download_file(url_target):
+    file_url, target_directory = url_target
+    file_name = os.path.basename(file_url)
+    target_path = os.path.join(target_directory, file_name)
+
+    try:
+        print(f"Downloading {file_url}...")
+
+        file_response = requests.get(file_url, stream=True)
+        file_response.raise_for_status()
+
+        # Save the file
+        with open(target_path, "wb") as file:
+            for chunk in file_response.iter_content(chunk_size=8192):
+                file.write(chunk)
+
+        print(f"Saved: {target_path}")
+    except requests.RequestException as e:
+        print(f"Failed to download {file_url}: {e}")
 
 
 def download_bz2_files(url, target_directory):
@@ -23,32 +45,19 @@ def download_bz2_files(url, target_directory):
 
     # Filter links ending with ".bz2"
     bz2_links = [
-        urljoin(url, link["href"]) for link in links if link["href"].endswith(".bz2")
+        (urljoin(url, link["href"]), target_directory)
+        for link in links
+        if link["href"].endswith(".bz2")
     ]
-
     if not bz2_links:
         print("No .bz2 files found on the given URL.")
         return
-
-    # Download each file
-    for file_url in bz2_links:
-        file_name = os.path.basename(file_url)
-        target_path = os.path.join(target_directory, file_name)
-
-        try:
-            print(f"Downloading {file_url}...")
-
-            file_response = requests.get(file_url, stream=True)
-            file_response.raise_for_status()
-
-            # Save the file
-            with open(target_path, "wb") as file:
-                for chunk in file_response.iter_content(chunk_size=8192):
-                    file.write(chunk)
-
-            print(f"Saved: {target_path}")
-        except requests.RequestException as e:
-            print(f"Failed to download {file_url}: {e}")
+    p = Pool(24)
+    try:
+        # Download files in parallel
+        p.map(download_file, bz2_links)
+    except Exception as e:
+        print(f"An error occurred during downloading: {e}")
 
 
 if __name__ == "__main__":
