@@ -25,13 +25,23 @@ if not n_cpus:
     n_cpus = 1
 spark_ui_port = os.getenv("__SPARK_UI_PORT")
 print(spark_ui_port)
-# jars = os.getenv("VASTDB_CONNECTOR_JARS")
+jars = os.getenv("VASTDB_CONNECTOR_JARS")
 # print(jars)
 SLURM_ARRAY_TASK_ID = int(os.getenv("SLURM_ARRAY_TASK_ID"))
 SLURM_JOB_ID = int(os.getenv("SLURM_JOB_ID"))
 spark = (
     SparkSession.builder.appName(f"colabfit_{SLURM_JOB_ID}_{SLURM_ARRAY_TASK_ID}")
     .master(f"local[{n_cpus}]")
+    .config("spark.jars", jars)
+    .config("spark.executor.memoryOverhead", "8g")
+    .config("spark.port.maxRetries", 50)
+    .config("spark.sql.shuffle.partitions", 2400)
+    .config("spark.network.timeout", "500s")
+    .config("spark.rpc.askTimeout", "500s")
+    .config("spark.executor.heartbeatInterval", "60s")
+    .config("spark.yarn.maxAppAttempts", 5)
+    .config("spark.task.maxFailures", 1)
+    .config("spark.driver.maxResultSize", 0)
     .config("spark.ui.port", f"{spark_ui_port}")
     .getOrCreate()
 )
@@ -93,10 +103,6 @@ with session.transaction() as tx:
         internal_row_id=False,
     )
     df_batch = reader.read_all().to_struct_array().to_pandas()
-    # df_batch["metadata_size"] = (
-    #     df_batch["metadata_size"].apply(fillna_in_place).astype(int)
-    # )
-    # df_batch = df_batch.replace({np.nan: None})
 
     df_batch = spark.createDataFrame(df_batch, schema=read_schema)
     # df_batch = df_batch.withColumn(
