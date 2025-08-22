@@ -42,6 +42,17 @@ with sess.transaction() as tx:
         unsorted_columns=unsorted_columns,
     )
 
+sorted_columns = ["dataset_id"]
+unsorted_columns = ["id", "name", "description"]
+with sess.transaction() as tx:
+    table = tx.bucket("colabfit-prod").schema("prod").table("cs_tmp")
+    table.create_projection(
+        projection_name="cs-dataset_id",
+        sorted_columns=sorted_columns,
+        unsorted_columns=unsorted_columns,
+    )
+
+
 cs_map_table = "ndb.colabfit.dev.cs_co_wip"
 to_cs_map_table = "ndb.`colabfit-prod`.prod.cs_co_map_tmp"
 

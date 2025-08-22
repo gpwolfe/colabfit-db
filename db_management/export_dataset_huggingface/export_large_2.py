@@ -5,22 +5,17 @@ from ast import literal_eval
 from pathlib import Path
 
 import boto3
-import numpy as np
 import pyspark.sql.functions as sf
 from botocore.exceptions import ClientError
 from colabfit.tools.vast.schema import (
-    config_schema,
     dataset_arr_schema,
-    property_object_schema,
 )
 from colabfit.tools.vast.utilities import (
     str_to_arrayof_int,
     str_to_arrayof_str,
     str_to_nestedarrayof_double,
 )
-import pyarrow as pa
-from dotenv import load_dotenv
-from pyspark.sql import Row, SparkSession
+from pyspark.sql import SparkSession
 from pyspark.sql.types import (
     ArrayType,
     BooleanType,
@@ -31,8 +26,13 @@ from pyspark.sql.types import (
     StructType,
     TimestampType,
 )
-from vastdb.session import Session
-from colabfit.tools.vast.database import batched
+from vastdb.config import QueryConfig
+
+config = QueryConfig(
+    limit_rows_per_sub_split=10_000,
+    rows_per_split=1_000_000,
+)
+# from pyspark import StorageLevel
 
 with open("/scratch/gw2338/colabfit-tools/.env") as f:
     envvars = dict(x.strip().split("=") for x in f.readlines())
@@ -42,7 +42,7 @@ spark = (
     SparkSession.builder.appName("colabfit")
     .config("spark.jars", jars)
     .config("spark.executor.memoryOverhead", "600")
-    .config("spark.sql.shuffle.partitions", 16)
+    .config("spark.sql.shuffle.partitions", 4000)
     .config("spark.driver.maxResultSize", 0)
     .config("spark.sql.adaptive.enabled", "true")
     .getOrCreate()
@@ -51,13 +51,12 @@ spark = (
 access = envvars.get("SPARK_ID")
 secret = envvars.get("SPARK_KEY")
 endpoint = envvars.get("SPARK_ENDPOINT")
-sess = Session(access=access, secret=secret, endpoint=endpoint)
 
 
 logger = logging.getLogger(f"{__name__}")
 logger.setLevel("INFO")
-PO_ID_BATCH_SIZE = 1000
-logger.info(f"PO_ID_BATCH_SIZE: {PO_ID_BATCH_SIZE}")
+# PO_ID_BATCH_SIZE = 5000
+# logger.info(f"PO_ID_BATCH_SIZE: {PO_ID_BATCH_SIZE}")
 
 
 ############################################
@@ -99,7 +98,7 @@ class S3FileManager:
             return f"Error: {str(e)}"
 
 
-def read_md_partition(partition, config):
+def create_metadata_reader_udf(config):
     s3_mgr = S3FileManager(
         bucket_name=config["bucket_dir"],
         access_id=config["access_key"],
@@ -107,22 +106,48 @@ def read_md_partition(partition, config):
         endpoint_url=config["endpoint"],
     )
 
-    def process_row(row):
-        rowdict = row.asDict()
+    def read_metadata(metadata_path):
+        if metadata_path is None:
+            return None
         try:
-            if row["metadata_path"] is None:
-                rowdict["metadata"] = None
-            else:
-                rowdict["metadata"] = s3_mgr.read_file(row["metadata_path"])
+            return s3_mgr.read_file(metadata_path)
         except ClientError as e:
             if e.response["Error"]["Code"] == "404":
-                rowdict["metadata"] = None
+                return None
             else:
-                logger.info(f"Error reading {row['metadata_path']}: {str(e)}")
-                rowdict["metadata"] = None
-        return Row(**rowdict)
+                logger.info(f"Error reading {metadata_path}: {str(e)}")
+                return None
 
-    return map(process_row, partition)
+    return sf.udf(read_metadata, StringType())
+
+
+############################################
+# Optimized Column Transformation Helpers
+############################################
+def create_column_transformer(col_name, col_type_map):
+    """Create optimized column transformations based on type mapping"""
+    if col_name in col_type_map.get("nested_double", []):
+        return str_to_nestedarrayof_double(sf.col(col_name)).alias(col_name)
+    elif col_name in col_type_map.get("int_array", []):
+        return str_to_arrayof_int(sf.col(col_name)).alias(col_name)
+    elif col_name in col_type_map.get("str_array", []):
+        return str_to_arrayof_str(sf.col(col_name)).alias(col_name)
+    elif col_name in col_type_map.get("double_array", []):
+        return str_to_arrayof_double(sf.col(col_name)).alias(col_name)
+    elif col_name in col_type_map.get("bool_array", []):
+        return str_to_arrayof_bool(sf.col(col_name)).alias(col_name)
+    elif col_name in col_type_map.get("nested_int", []):
+        return str_to_nestedarrayof_int(sf.col(col_name)).alias(col_name)
+    else:
+        return sf.col(col_name)
+
+
+def create_column_renamer(col_name, prefix, special_cols):
+    """Create optimized column renaming based on special column sets"""
+    if col_name in special_cols:
+        return sf.col(col_name).alias(f"{prefix}_{col_name}")
+    else:
+        return sf.col(col_name)
 
 
 ############################################
@@ -135,27 +160,6 @@ config = {
     "endpoint": endpoint,
     "metadata_dir": "data/MD",
 }
-
-
-@sf.udf("array<boolean>")
-def pbc(cell):
-    return [any([any(x) for x in cell])] * 3
-
-    # cell = np.array(cell).astype(float)
-    # cell_lengths = np.linalg.norm(np.array(cell).astype(float), axis=1)
-    # pbc = cell_lengths > 1e-10
-    # return pbc.astype(bool).tolist()
-
-
-@sf.udf("array<int>")
-def dimension_types(pbc):
-    dim_types = np.array(pbc).astype(int).tolist()
-    return dim_types
-
-
-@sf.udf("int")
-def nperiodic_dimensions(dim_types):
-    return int(sum(dim_types))
 
 
 @sf.udf(returnType=ArrayType(DoubleType()))
@@ -205,6 +209,7 @@ po_tmp_schema = StructType(
         StructField("cauchy_stress_volume_normalized", BooleanType(), True),
         StructField("electronic_band_gap", DoubleType(), True),
         StructField("electronic_band_gap_type", StringType(), True),
+        StructField("energy_above_hull", DoubleType(), True),
         StructField("formation_energy", DoubleType(), True),
         StructField("adsorption_energy", DoubleType(), True),
         StructField("atomization_energy", DoubleType(), True),
@@ -244,6 +249,7 @@ po_tmp_schema2 = StructType(
         StructField("cauchy_stress_volume_normalized", BooleanType(), True),
         StructField("electronic_band_gap", DoubleType(), True),
         StructField("electronic_band_gap_type", StringType(), True),
+        StructField("energy_above_hull", DoubleType(), True),
         StructField("formation_energy", DoubleType(), True),
         StructField("adsorption_energy", DoubleType(), True),
         StructField("atomization_energy", DoubleType(), True),
@@ -339,8 +345,8 @@ cols_to_drop_both = ["metadata_path", "metadata_size"]
 cols_in_both = ["hash", "id", "last_modified", "metadata", "metadata_id"]
 cols_duplicd = [
     "chemical_formula_hill",
-    "chemical_formula_reduced",
-    "chemical_formula_anonymous",
+    # "chemical_formula_reduced",
+    # "chemical_formula_anonymous",
 ]
 cols_to_prepend_config = [
     "labels",
@@ -425,217 +431,111 @@ dataset_cols_in_order = [
 all_cols = row_cols_in_order + dataset_cols_in_order
 
 
-def get_session():
-    load_dotenv()
-    access = os.getenv("VAST_DB_ACCESS")
-    secret = os.getenv("VAST_DB_SECRET")
-    endpoint = os.getenv("VAST_DB_ENDPOINT")
-    return Session(access=access, secret=secret, endpoint=endpoint)
+# def get_session():
+#     load_dotenv()
+#     access = os.getenv("VAST_DB_ACCESS")
+#     secret = os.getenv("VAST_DB_SECRET")
+#     endpoint = os.getenv("VAST_DB_ENDPOINT")
+#     return Session(access=access, secret=secret, endpoint=endpoint)
 
 
-def pa_table_slicer(table: pa.Table):
-    num_rows = table.num_rows()
-    batch_size = PO_ID_BATCH_SIZE
-    num_batches = (num_rows + batch_size - 1) // batch_size
-    for i in range(num_batches):
-        start = i * batch_size
-        end = min(num_rows, (i + 1) * batch_size)
-        yield table.slice(start, end - start)
+def get_cos(dataset_id):
+    co_columns = [col for col in spark.table("ndb.`colabfit-prod`.prod.co").columns]
+    logger.info(f"co_columns: {co_columns}")
 
+    co_type_map = {
+        "nested_double": co_nested_arr_cols,
+        "int_array": co_int_arr_cols,
+        "str_array": co_str_arr_cols,
+        "double_array": co_double_arr_cols,
+        "bool_array": co_bool_arr_cols,
+    }
 
-def save_po_ids(ds_id):
-    tmp_file = f"/scratch/gw2338/tmp_po_ids_{ds_id}.txt"
-    if os.path.exists(tmp_file):
-        os.remove(tmp_file)
-    sess = get_session()
-    with sess.transaction() as tx:
-        table = tx.bucket("colabfit-prod").schema("prod").table("po")
-        reader = table.select(
-            predicate=table["dataset_id"] == ds_id,
-            columns=["id"],
-            internal_row_id=False,
-        )
-        for batch in reader:
-            po_ids = batch.column("id").to_pylist()
-            with open(tmp_file, "a") as f:
-                for po_id in po_ids:
-                    f.write(f"{po_id}\n")
-    return tmp_file
+    transformed_cols = [
+        create_column_transformer(col, co_type_map) for col in co_columns
+    ]
 
-
-def get_po_ids_from_file(file_path):
-    with open(file_path, "r") as f:
-        po_ids = [line.strip() for line in f.readlines()]
-    yield from batched(po_ids, PO_ID_BATCH_SIZE)
-
-
-def get_pos(po_id_batch):
-    session = get_session()
-    with session.transaction() as tx:
-        table = tx.bucket("colabfit-prod").schema("prod").table("po")
-        reader = table.select(
-            predicate=table.id.isin(po_id_batch),
-            columns=[col.name for col in property_object_schema],
-        )
-        pos = reader.read_all()
-    pos = pos.select([field.name for field in property_object_schema])
-    return pos
-
-
-def get_cos(co_ids):
-    session = get_session()
-    with session.transaction() as tx:
-        table = tx.bucket("colabfit-prod").schema("prod").table("co")
-        reader = table.select(
-            predicate=table["id"].isin(co_ids),
-            columns=[col.name for col in config_schema],
-            internal_row_id=False,
-        )
-        data = reader.read_all()
-    data = (
-        data.select([field.name for field in config_schema])
-        .to_struct_array()
-        .to_pandas()
-    )
-    # pandas coerces int cols with nulls to float (np.nan as float)
-    # not interpretable as int by pyspark
-    for x in data:
-        if x["metadata_size"] is not None:
-            x["metadata_size"] = int(x["metadata_size"])
-        else:
-            x["metadata_size"] = None
-    df = spark.createDataFrame(data, config_schema)
-    return df
-
-
-def process_configs(cos):
-    cos_arr = cos.select(
-        [
-            (
-                str_to_nestedarrayof_double(sf.col(col)).alias(col)
-                if col in co_nested_arr_cols
-                else (
-                    str_to_arrayof_int(sf.col(col)).alias(col)
-                    if col in co_int_arr_cols
-                    else (
-                        str_to_arrayof_str(sf.col(col)).alias(col)
-                        if col in co_str_arr_cols
-                        else (
-                            str_to_arrayof_double(sf.col(col)).alias(col)
-                            if col in co_double_arr_cols
-                            else (
-                                str_to_arrayof_bool(sf.col(col)).alias(col)
-                                if col in co_bool_arr_cols
-                                else col
-                            )
-                        )
-                    )
-                )
-            )
-            for col in cos.columns
-        ]
+    cos = (
+        spark.table("ndb.`colabfit-prod`.prod.co")
+        .filter(sf.col("dataset_ids").contains(dataset_id))
+        .select(transformed_cols)
     )
 
-    cos = cos_arr.withColumn("pbc", pbc(sf.col("cell")))
-    cos = cos.withColumn("dimension_types", dimension_types(sf.col("pbc")))
-    cos = cos.withColumn(
-        "nperiodic_dimensions", nperiodic_dimensions(sf.col("dimension_types"))
-    )
+    metadata_udf = create_metadata_reader_udf(config)
+    cos = cos.withColumn("metadata", metadata_udf(sf.col("metadata_path")))
 
-    cos = cos.rdd.mapPartitions(lambda partition: read_md_partition(partition, config))
-    cos = cos.toDF(co_tmp_schema)
+    special_cols = set(cols_in_both + cols_to_prepend_config)
+    renamed_cols = [
+        create_column_renamer(col, "configuration", special_cols)
+        for col in cos.columns
+        if col not in cols_to_drop_both
+    ]
+
+    cos = cos.select(renamed_cols)
+
+    cos = cos.coalesce(200)
+
     return cos
 
 
-def get_pos_df(batch):
-    pos = spark.createDataFrame(
-        batch.to_struct_array().to_pandas(), property_object_schema
+def get_pos(dataset_id):
+    logger.info(f"Processing property objects for dataset {dataset_id}")
+    po_type_map = {
+        "nested_double": po_arr_cols,
+    }
+    pos_columns = spark.table("ndb.`colabfit-prod`.prod.po").columns
+    transformed_cols = [
+        create_column_transformer(col, po_type_map)
+        for col in po_tmp_schema2.fieldNames()
+        if (col != "metadata" and col in pos_columns)
+    ]
+    pos = (
+        spark.table("ndb.`colabfit-prod`.prod.po")
+        .filter(sf.col("dataset_id") == dataset_id)
+        .select(transformed_cols)
     )
-    pos = pos.select(
-        [
-            (
-                col
-                if col not in po_arr_cols
-                else str_to_nestedarrayof_double(sf.col(col)).alias(col)
-            )
-            for col in po_tmp_schema2.fieldNames()
-            if col != "metadata"
-        ]
-    )
-    pos = pos.rdd.mapPartitions(lambda partition: read_md_partition(partition, config))
-    pos = spark.createDataFrame(
-        pos,
-        po_tmp_schema2,
-    )
-    pos = pos.drop(*cols_to_drop_both)
+
+    metadata_udf = create_metadata_reader_udf(config)
+    pos = pos.withColumn("metadata", metadata_udf(sf.col("metadata_path")))
+    logger.info(f"pos columns: {pos.columns}")
+    special_cols = set(cols_in_both)
+    renamed_cols = [
+        create_column_renamer(col, "property_object", special_cols)
+        for col in pos.columns
+        if col not in cols_to_drop_both
+    ]
+
+    pos = pos.select(renamed_cols)
+    logger.info(f"final pos columns: {pos.columns}")
     return pos
 
 
-def get_podf_and_codf_from_po_batch(po_batch):
-    coids = list(set(po_batch.column("configuration_id").to_pylist()))
-    cos = get_cos(coids)
-    cos = process_configs(cos)
-    pos = get_pos_df(po_batch)
-    return pos, cos
-
-
 def merge_po_co_rows(pos, cos):
-    pos = pos.select(
-        [
-            sf.col(col).alias(f"property_object_{col}") if col in cols_in_both else col
-            for col in pos.columns
-        ]
-    )
-    pos = pos.drop(*cols_duplicd)
-    cos = cos.drop(*cols_to_drop_both)
-    cos = cos.select(
-        [
-            (
-                sf.col(col).alias(f"configuration_{col}")
-                if col in cols_in_both + cols_to_prepend_config
-                else col
-            )
-            for col in cos.columns
-        ]
-    )
-    dimension_agg = cos.agg(
-        sf.collect_set("nperiodic_dimensions").alias("dataset_nperiodic_dimensions"),
-        sf.collect_set("dimension_types").alias("dataset_dimension_types"),
-    ).collect()[0]
-    cos = cos.withColumn(
-        "dataset_nperiodic_dimensions",
-        sf.lit(dimension_agg["dataset_nperiodic_dimensions"]),
-    ).withColumn(
-        "dataset_dimension_types", sf.lit(dimension_agg["dataset_dimension_types"])
-    )
+    existing_duplicated = [col for col in cols_duplicd if col in cos.columns]
+    cos = cos.drop(*existing_duplicated).withColumnRenamed("id", "configuration_id")
     rows = pos.join(cos, on="configuration_id", how="left")
     return rows
 
 
 def get_dataset(dataset_df):
-    dataset = dataset_df.select(
-        [
-            (
-                str_to_arrayof_int(sf.col(col)).alias(col)
-                if col in ds_int_arr_cols
-                else (
-                    str_to_arrayof_str(sf.col(col)).alias(col)
-                    if col in ds_str_arr_cols
-                    else (
-                        str_to_arrayof_double(sf.col(col)).alias(col)
-                        if col in ds_double_arr_cols
-                        else (
-                            str_to_nestedarrayof_int(sf.col(col)).alias(col)
-                            if col in ds_nested_intarr_cols
-                            else col
-                        )
-                    )
-                )
-            )
-            for col in dataset_df.columns
-        ]
-    )
-    dataset = dataset.drop("dimension_types", "nperiodic_dimensions")
+    """Optimized dataset processing"""
+    logger.info("Get dataset")
+    # Create column type mapping for efficient transformations
+    ds_type_map = {
+        "int_array": ds_int_arr_cols,
+        "str_array": ds_str_arr_cols,
+        "double_array": ds_double_arr_cols,
+        "nested_int": ds_nested_intarr_cols,
+    }
+
+    # Apply transformations in one pass
+    transformed_cols = [
+        create_column_transformer(col, ds_type_map) for col in dataset_df.columns
+    ]
+
+    dataset = dataset_df.select(transformed_cols)
+
+    # Rename all columns with dataset prefix in one operation
     dataset = dataset.select(
         *[sf.col(col).alias(f"dataset_{col}") for col in dataset.columns]
     )
@@ -643,6 +543,7 @@ def get_dataset(dataset_df):
 
 
 def generate_dataset_citation_string(item):
+    logger.info(f"Generating citation for dataset {item['id']}")
     joined_names_string = None
     joined_names = []
 
@@ -677,10 +578,13 @@ def process_ds_id(ds_id):
         sf.col("id") == ds_id
     )
     ds_row = dataset_df.first()
-    logger.info(f"Dataset: {ds_row['name']}")
+
     if ds_row is None:
         logger.info(f"Dataset {ds_id} not found. Continuing.")
         return
+
+    logger.info(f"Dataset: {ds_row['name']}")
+
     dataset_name = (
         ds_row["name"]
         .replace("@", "_")
@@ -689,35 +593,44 @@ def process_ds_id(ds_id):
         .replace("/", "_")
         .replace("+", "_")
     )
-    dataset_dir = Path(f"datasets/{dataset_name}")
+    dataset_dir = Path(f"datasets_extralarge/{dataset_name}")
     dataset_dir.mkdir(exist_ok=True)
     if (dataset_dir / dataset_name).exists():
         logger.info(f"Dataset {dataset_name} already exists. Continuing.")
         return
     citation = generate_dataset_citation_string(ds_row)
-    # ideal_partitions = max(4, ds_row["nconfigurations"] // 50000)
-    # closest_2factor = 2 ** (round(log2(ideal_partitions)))
 
-    ############################################
-    # Get Property Objects
-    ############################################
+    logger.info(f"Processing dataset id: {ds_id}")
+
     dataset = get_dataset(dataset_df)
     dataset.cache()
 
-    logger.info(f"dataset id: {ds_id}")
-    po_tmp_file = save_po_ids(ds_id)
-    po_id_batches = get_po_ids_from_file(po_tmp_file)
-    for i, batch in enumerate(po_id_batches):
-        pos_batch = get_pos(batch)
-        pos, cos = get_podf_and_codf_from_po_batch(pos_batch)
-        merged_po_co = merge_po_co_rows(pos, cos)
-        merged_po_co_ds = merged_po_co.join(dataset, on="dataset_id", how="left")
-        final_rows = merged_po_co_ds.select(*all_cols)
-        final_rows.coalesce(1).write.mode("append").parquet(
-            str(dataset_dir / dataset_name)
-        )
-        logger.info(f"--> Batch {i} written to parquet")
+    cos = get_cos(dataset_id=ds_id)
 
+    pos = get_pos(dataset_id=ds_id)
+    merged_po_co = merge_po_co_rows(pos, cos)
+    logger.info("merged co po rows")
+    merged_po_co_ds = merged_po_co.join(dataset, on="dataset_id", how="left")
+    logger.info("joined co po ds")
+    logger.info(f"merged_po_co_ds columns: {merged_po_co_ds.columns}")
+    final_rows = merged_po_co_ds.select(*all_cols)
+    logger.info("final rows selected")
+
+    # Optimize partitioning based on dataset size
+    nconfigs = ds_row["nconfigurations"]
+    if nconfigs > 100000:
+        final_rows = final_rows.repartition(max(8, nconfigs // 50000))
+    elif nconfigs > 10000:
+        final_rows = final_rows.repartition(4)
+    else:
+        final_rows = final_rows.coalesce(2)
+
+    # Write to parquet with optimized settings
+    final_rows.write.mode("append").option("compression", "snappy").parquet(
+        str(dataset_dir / dataset_name / "main")
+    )
+
+    logger.info(f"Finished writing {dataset_name}, {ds_id} to parquet")
     ############################################
     # Create dataset card
     ############################################
@@ -755,15 +668,29 @@ def process_ds_id(ds_id):
         f.write(text)
     logger.info("README written")
     logger.info("Done!")
-    dataset.unpersist()
 
 
 def main(ds_id_file):
     with open(ds_id_file) as f:
-        ds_ids = [x.strip() for x in f.readlines()]
-    for ds_id in ds_ids:
-        logger.info(f"Processing dataset id: {ds_id}")
-        process_ds_id(ds_id)
+        ds_ids = [x.strip().split(",")[0] for x in f.readlines()][1:]
+        ds_ids.reverse()
+
+    logger.info(f"Processing {len(ds_ids)} datasets")
+
+    for i, ds_id in enumerate(ds_ids, 1):
+        logger.info(f"Processing dataset {i}/{len(ds_ids)}: {ds_id}")
+        try:
+            process_ds_id(ds_id)
+        except Exception as e:
+            logger.error(f"Error processing dataset {ds_id}: {str(e)}")
+            continue
+
+        # Force garbage collection periodically for large batches
+        # if i % 10 == 0:
+        spark.catalog.clearCache()
+        logger.info(f"Cleared cache after processing {i} datasets")
+
+    logger.info("All datasets processed successfully")
 
 
 if __name__ == "__main__":
