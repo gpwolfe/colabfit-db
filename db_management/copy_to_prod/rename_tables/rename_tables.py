@@ -15,6 +15,9 @@ for t in ["ds", "cs", "co", "po", "cs_co_map"]:
         print(f"Renaming table {t} to {t}_{date}")
         with sess.transaction() as tx:
             table = tx.bucket("colabfit-prod").schema("prod").table(t)
+            for proj in table.projections():
+                print(f"Dropping projection {proj.name}")
+                proj.drop()
             table.rename(f"{t}_{date}")
             for proj in table.projections():
                 try:
