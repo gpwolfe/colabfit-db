@@ -1,5 +1,6 @@
 import os
 import logging
+from time import time
 
 from colabfit.tools.vast.schema import config_prop_arr_schema
 from pyspark.sql.types import (
@@ -13,6 +14,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import udf, lit, substring, col
 from vastdb.session import Session
 
+begin = time()
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -108,11 +110,8 @@ if TASK_ID > len(ids):
 # if TASK_ID < 10000:
 #     raise ValueError(f"SLURM_TASK_ID {TASK_ID} must be >= 1000")
 prefix = f"PO_{ids[TASK_ID]:05d}"
+logger.info(f"Processing prefix {prefix} (task ID {TASK_ID})")
 df = spark.table(table).filter(f'property_id like "{prefix}%"')
-
-
-# df = df.withColumn("prefix_partition", lit(prefix))
-
 
 df = df.withColumn("prefix_partition", substring(col("property_id"), 1, 8))
 
@@ -163,11 +162,15 @@ logger.info(f"Columns after select: {df.columns}")
 
 try:
     spark.sql("select ndb.create_tx()").show()
-    df.write.mode("append").partitionBy("prefix_partition").saveAsTable(
-        "ndb.colabfit.dev.copo_make_arrays",
+    df.write.mode("append").saveAsTable(
+        "ndb.`colabfit-prod`.prod.copo_make_arrays",
     )
+    # df.write.mode("append").partitionBy("prefix_partition").saveAsTable(
+    #     "ndb.colabfit.dev.copo_make_arrays",
+    # )
     spark.sql("select ndb.commit_tx()").show()
     logger.info(f"Successfully wrote data for prefix {prefix}")
+    logger.info(f"Finished in {time() - begin} seconds")
 except Exception as e:
     logger.error(f"Write failed for prefix {prefix}: {e}")
     try:
