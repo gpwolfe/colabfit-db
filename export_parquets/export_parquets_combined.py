@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel("INFO")
 
 config = QueryConfig(
-    limit_rows_per_sub_split=10_000,
+    limit_rows_per_sub_split=100_000,
     rows_per_split=1_000_000,
     num_sub_splits=10,
 )
