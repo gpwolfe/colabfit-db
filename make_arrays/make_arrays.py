@@ -13,7 +13,7 @@ from pyspark.sql.types import (
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import udf, lit, substring, col
 from vastdb.session import Session
-
+from ast import literal_eval
 begin = time()
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -55,7 +55,7 @@ def _eval_or_empty(lststr):
         logger.info("Replacing 'nan' with math.nan")
         lststr = lststr.replace("nan", "math.nan")
         logger.info(f"updated to {lststr}")
-    return eval(lststr)
+    return literal_eval(lststr)
 
 
 @udf(returnType=ArrayType(StringType()))
