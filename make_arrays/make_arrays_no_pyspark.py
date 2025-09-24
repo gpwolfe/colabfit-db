@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 
 TASK_ID = int(os.getenv("SLURM_ARRAY_TASK_ID"))
 from_table = "ndb.colabfit-prod.prod.co_po_merged_innerjoin".split(".")
-to_table = "ndb.colabfit-prod.prod.copo_arrays_no_pyspark".split(".")
+to_table = "ndb.colabfit-prod.prod.copo_arrays_no_pyspark4".split(".")
 
 
 def get_vastdb_session():
@@ -216,39 +216,44 @@ def write_to_array_table():
             predicate=co_table["property_id"].startswith(prefix),
         )
         write_rows = 0
-        write_tables = []
-        try:
-            managed_batches = batch_manager(co_data, target_batch_size=50_000)
-            for i, co_batch in enumerate(managed_batches):
-                batch_count += 1
-                batch_rows = co_batch.num_rows
-                write_rows += batch_rows
-                logger.info(f"Read CO batch {i}: {batch_rows} rows")
-                if batch_rows == 0:
-                    logger.warning(f"CO batch {i} is empty, skipping")
-                    continue
-                co_data_transformed = transform_table_arrays(co_batch, co_type_map)
-                logger.info(
-                    f"Transformed CO batch {i}: {co_data_transformed.num_rows} rows"
-                )
-                write_tables.append(co_data_transformed)
-            if not write_tables:
-                raise ValueError(f"No data found for prefix {prefix}")
-            write_table = pa.concat_tables(write_tables)
-            write_table = write_table.append_column(
-                pa.field("prefix_partition", pa.string()),
-                pa.array([prefix] * write_rows),
-            )
-            write_table = write_table.select(co_write_schema.names)
-            write_table = write_table.cast(co_write_schema)
-            print(write_table.schema)
+        # write_tables = []
+        # try:
+        # managed_batches = batch_manager(co_data, target_batch_size=50_000)
+        # for i, co_batch in enumerate(managed_batches):
+        # for i, co_batch in enumerate(co_data):
+        co_batch = co_data.read_all()
+        batch_count += 1
+        batch_rows = co_batch.num_rows
+        write_rows += batch_rows
+        logger.info(f"Read CO batch {batch_count}: {batch_rows} rows")
+        if batch_rows == 0:
+            logger.warning(f"CO batch {batch_count} is empty, skipping")
+            # continue
+        # co_data_transformed = transform_table_arrays(co_batch, co_type_map)
+        # logger.info(
+        #     f"Transformed CO batch {batch_count}: {co_data_transformed.num_rows} rows"
+        # )
+        # assert co_data_transformed.num_rows == co_batch.num_rows
+        # write_tables.append(co_data_transformed)
+        # if not write_tables:
+        #     raise ValueError(f"No data found for prefix {prefix}")
+        # write_table = pa.concat_tables(write_tables)
+        write_table = co_batch
+        assert write_table.num_rows == write_rows
+        write_table = write_table.append_column(
+            pa.field("prefix_partition", pa.string()),
+            pa.array([prefix] * write_rows),
+        )
+        write_table = write_table.select(co_write_schema.names)
+        # write_table = write_table.cast(co_write_schema)
+        print(write_table.schema)
 
-        except Exception as e:
-            logger.error(f"Error processing CO data for dataset {prefix}: {str(e)}")
-            raise
+        # except Exception as e:
+        #     logger.error(f"Error processing CO data for dataset {prefix}: {str(e)}")
+        #     raise
     with session.transaction() as tx:
-        # vast_schema = tx.bucket(to_table[1]).schema(to_table[2])
-        # vast_schema.create_table(to_table[3], columns=write_table.schema)
+        vast_schema = tx.bucket(to_table[1]).schema(to_table[2])
+        vast_schema.create_table(to_table[3], columns=write_table.schema)
         new_co_table = tx.bucket(to_table[1]).schema(to_table[2]).table(to_table[3])
         new_co_table.insert(write_table)
     logger.info(f"Wrote {write_table.num_rows} rows to {to_table[3]}")
