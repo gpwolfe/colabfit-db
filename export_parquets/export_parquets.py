@@ -1,61 +1,38 @@
 import logging
+import math
 import os
 import sys
 from ast import literal_eval
 from pathlib import Path
+from time import time
 
 import boto3
-import pyspark.sql.functions as sf
-from botocore.exceptions import ClientError
+from ibis import _
+import pyarrow as pa
+import vastdb
+from concurrent.futures import ThreadPoolExecutor
 from colabfit.tools.vast.schema import (
-    config_arr_schema,
+    config_prop_arr_schema,
     configuration_set_arr_schema,
     dataset_arr_schema,
-    property_object_arr_schema,
 )
-from colabfit.tools.vast.utilities import (
-    str_to_arrayof_int,
-    str_to_arrayof_str,
-    str_to_nestedarrayof_double,
-)
-from pyspark.sql import SparkSession
-from pyspark.sql.types import (
-    ArrayType,
-    BooleanType,
-    DoubleType,
-    IntegerType,
-    StringType,
-)
+from colabfit.tools.vast.utilities import spark_schema_to_arrow_schema
+from dotenv import load_dotenv
 
+load_dotenv()
 
-with open("/scratch/gw2338/colabfit-tools/.env") as f:
-    envvars = dict(x.strip().split("=") for x in f.readlines())
-
-jars = os.getenv("VASTDB_CONNECTOR_JARS")
-spark = (
-    SparkSession.builder.appName("colabfit")
-    .config("spark.jars", jars)
-    .config("spark.executor.memoryOverhead", "600")
-    # .config("spark.sql.shuffle.partitions", 4000)
-    .config("spark.driver.maxResultSize", 0)
-    .config("spark.sql.adaptive.enabled", "true")
-    # .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-    # .config("spark.sql.adaptive.localShuffleReader.enabled", "true")
-    # .config("spark.sql.adaptive.skewJoin.enabled", "true")
-    # .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-    # .config("spark.sql.execution.arrow.pyspark.enabled", "true")
-    .getOrCreate()
-)
-# TASK_ID = int(os.getenv("SLURM_ARRAY_TASK_ID"))
-access = envvars.get("SPARK_ID")
-secret = envvars.get("SPARK_KEY")
-endpoint = envvars.get("SPARK_ENDPOINT")
-
-
-logger = logging.getLogger(f"{__name__}")
+logger = logging.getLogger(__name__)
 logger.setLevel("INFO")
 
-parquet_directory = "/scratch/gw2338/vast/data-lake-main/spark/scripts/parquet_export"
+CONFIG = {
+    "MAX_WORKERS": 10,  # More reasonable for S3 connections
+    "CO_BATCH_SIZE": 200_000,  # Match your current usage
+    "CS_BATCH_SIZE": 100_000,
+    "FILE_ROW_LIMIT": 1_000_000,  # Match your current usage
+    "CSCO_BATCH_SIZE": 10_000,
+    "COMPRESSION_LEVEL": 18,
+    "LARGE_DATASET_THRESHOLD": 5_000_000,
+}
 
 
 class S3FileManager:
@@ -64,6 +41,7 @@ class S3FileManager:
         self.access_id = access_id
         self.secret_key = secret_key
         self.endpoint_url = endpoint_url
+        self._client = self.get_client()
 
     def get_client(self):
         return boto3.client(
@@ -87,337 +65,536 @@ class S3FileManager:
 
     def read_file(self, file_key):
         try:
-            client = self.get_client()
-            response = client.get_object(Bucket=self.bucket_name, Key=file_key)
+            response = self._client.get_object(Bucket=self.bucket_name, Key=file_key)
             return response["Body"].read().decode("utf-8")
         except Exception as e:
             return f"Error: {str(e)}"
 
 
-def create_metadata_reader_udf(config):
-    s3_mgr = S3FileManager(
-        bucket_name=config["bucket_dir"],
-        access_id=config["access_key"],
-        secret_key=config["access_secret"],
-        endpoint_url=config["endpoint"],
+def get_s3_file_manager():
+    endpoint = "http://10.32.38.210"
+    with open(f"/home/{os.environ['USER']}/.vast-dev/access_key_id", "r") as f:
+        access_key = f.read().rstrip("\n")
+    with open(f"/home/{os.environ['USER']}/.vast-dev/secret_access_key", "r") as f:
+        secret_key = f.read().rstrip("\n")
+    return S3FileManager(
+        bucket_name="colabfit-data",
+        access_id=access_key,
+        secret_key=secret_key,
+        endpoint_url=endpoint,
     )
 
-    def read_metadata(metadata_path):
-        if metadata_path is None:
+
+def write_parquet_file(table, output_path, compression_level=None):
+    """Unified function to write parquet files with consistent settings"""
+    if compression_level is None:
+        compression_level = CONFIG["COMPRESSION_LEVEL"]
+    
+    with pa.parquet.ParquetWriter(
+        output_path,
+        table.schema,
+        compression="zstd",
+        compression_level=compression_level,
+    ) as writer:
+        writer.write_table(table)
+
+
+def read_metadata_column(table: pa.Table):
+    prop_paths = table["property_metadata_path"].to_pylist()
+    config_paths = table["configuration_metadata_path"].to_pylist()
+    max_workers = CONFIG["MAX_WORKERS"]
+
+    def safe_read(path_s3_tuple):
+        path, s3_mgr = path_s3_tuple
+        if path is None:
             return None
         try:
-            return s3_mgr.read_file(metadata_path)
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                return None
-            else:
-                logger.info(f"Error reading {metadata_path}: {str(e)}")
-                return None
+            return s3_mgr.read_file(path)
+        except Exception as e:
+            return f"Error: {str(e)}"
 
-    return sf.udf(read_metadata, StringType())
+    prop_unique = list({p for p in prop_paths if p is not None})
+    config_unique = list({c for c in config_paths if c is not None})
+    all_unique_paths = prop_unique + config_unique
+    logger.info(f"Found {len(all_unique_paths)} distinct metadata paths to read")
 
-
-def create_column_transformer(col_name, col_type_map):
-    """Create optimized column transformations based on type mapping"""
-    if col_name in col_type_map.get("nested_double", []):
-        return str_to_nestedarrayof_double(sf.col(col_name)).alias(col_name)
-    elif col_name in col_type_map.get("int_array", []):
-        return str_to_arrayof_int(sf.col(col_name)).alias(col_name)
-    elif col_name in col_type_map.get("str_array", []):
-        return str_to_arrayof_str(sf.col(col_name)).alias(col_name)
-    elif col_name in col_type_map.get("double_array", []):
-        return str_to_arrayof_double(sf.col(col_name)).alias(col_name)
-    elif col_name in col_type_map.get("bool_array", []):
-        return str_to_arrayof_bool(sf.col(col_name)).alias(col_name)
-    elif col_name in col_type_map.get("nested_int", []):
-        return str_to_nestedarrayof_int(sf.col(col_name)).alias(col_name)
+    start_md = time()
+    if not all_unique_paths:
+        prop_metadata_list = [None] * len(prop_paths)
+        config_metadata_list = [None] * len(config_paths)
     else:
-        return sf.col(col_name)
+        max_workers = min(max_workers, len(all_unique_paths))
+        s3s = [get_s3_file_manager() for _ in range(max_workers)]
+        all_unique_s3_map = [
+            (path, s3s[i % max_workers]) for i, path in enumerate(all_unique_paths)
+        ]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            all_results = list(executor.map(safe_read, all_unique_s3_map))
+        path_to_content = dict(zip(all_unique_paths, all_results))
+
+        prop_metadata_list = [
+            path_to_content.get(p) if p is not None else None for p in prop_paths
+        ]
+        config_metadata_list = [
+            path_to_content.get(c) if c is not None else None for c in config_paths
+        ]
+
+    end_md = time()
+    logger.info(f"Metadata read completed in {end_md - start_md:.2f} seconds")
+
+    prop_metadata_array = pa.array(prop_metadata_list).cast("string")
+    config_metadata_array = pa.array(config_metadata_list).cast("string")
+
+    table = table.append_column(
+        pa.field("configuration_metadata", pa.string(), nullable=True),
+        config_metadata_array,
+    )
+    table = table.append_column(
+        pa.field("property_metadata", pa.string(), nullable=True), prop_metadata_array
+    )
+    logger.info(f"MD ops finished in {time() - start_md:.2f} seconds")
+    return table
 
 
-def create_column_renamer(col_name, prefix, special_cols):
-    """Create optimized column renaming based on special column sets"""
-    if col_name in special_cols:
-        return sf.col(col_name).alias(f"{prefix}_{col_name}")
-    else:
-        return sf.col(col_name)
+def batch_manager(data_iterator, target_batch_size=100_000):
+    leftover_table = None
+    batch_num = 0
+    for raw_batch in data_iterator:
+        if raw_batch.num_rows == 0:
+            logger.info("Skipping empty raw batch")
+            continue
+        raw_table = pa.Table.from_batches([raw_batch])
+        if leftover_table is not None:
+            combined_table = pa.concat_tables([leftover_table, raw_table])
+            leftover_table = None
+        else:
+            combined_table = raw_table
+        current_offset = 0
+        while current_offset + target_batch_size <= combined_table.num_rows:
+            batch_to_yield = combined_table.slice(current_offset, target_batch_size)
+            logger.info(
+                f"Yielding batch {batch_num} with " f"{batch_to_yield.num_rows} rows"
+            )
+            yield batch_to_yield
+            batch_num += 1
+            current_offset += target_batch_size
+        remaining_rows = combined_table.num_rows - current_offset
+        if remaining_rows > 0:
+            leftover_table = combined_table.slice(current_offset, remaining_rows)
+    if leftover_table is not None and leftover_table.num_rows > 0:
+        logger.info(
+            f"Yielding final leftover batch {batch_num} with "
+            f"{leftover_table.num_rows} rows"
+        )
+        yield leftover_table
 
 
-config = {
-    "bucket_dir": "colabfit-data",
-    "access_key": access,
-    "access_secret": secret,
-    "endpoint": endpoint,
-    "metadata_dir": "data/MD",
+def str_to_arrayof_double(val):
+    """Convert string representation of array to actual array of doubles"""
+    if val is None:
+        return None
+    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
+        return literal_eval(val)
+    return val
+
+
+def str_to_arrayof_int(val):
+    """Convert string representation of array to actual array of integers"""
+    if val is None:
+        return None
+    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
+        return literal_eval(val)
+    return val
+
+
+def str_to_arrayof_str(val):
+    """Convert string representation of array to actual array of strings"""
+    if val is None:
+        return None
+    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
+        return literal_eval(val)
+    return val
+
+
+def str_to_arrayof_bool(val):
+    """Convert string representation of array to actual array of booleans"""
+    if val is None:
+        return None
+    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
+        return literal_eval(val)
+    return val
+
+
+def str_to_nestedarrayof_double(val):
+    """Convert string representation of nested array to actual nested array
+    of doubles"""
+    if val is None:
+        return None
+    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
+        try:
+            custom_globals = {"nan": math.nan}
+            return eval(val, custom_globals)
+        except (ValueError, SyntaxError) as e:
+            logger.error(f"Failed to parse nested array: {val[:100]}... Error: {e}")
+            return None
+    return val
+
+
+def str_to_nestedarrayof_int(val):
+    """Convert string representation of nested array to actual nested array
+    of integers"""
+    if val is None:
+        return None
+    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
+        return literal_eval(val)
+    return val
+
+
+co_arrow_schema = spark_schema_to_arrow_schema(config_prop_arr_schema)
+ds_arrow_schema = spark_schema_to_arrow_schema(dataset_arr_schema)
+cs_arrow_schema = spark_schema_to_arrow_schema(configuration_set_arr_schema)
+
+co_nested_arr_cols = [
+    field.name
+    for field in co_arrow_schema
+    if field.type == pa.list_(pa.list_(pa.float64()))
+]
+co_double_arr_cols = [
+    field.name for field in co_arrow_schema if field.type == pa.list_(pa.float64())
+]
+co_str_arr_cols = [
+    field.name for field in co_arrow_schema if field.type == pa.list_(pa.string())
+]
+co_int_arr_cols = [
+    field.name
+    for field in co_arrow_schema
+    if (field.type == pa.list_(pa.int64()) or field.type == pa.list_(pa.int32()))
+]
+co_bool_arr_cols = [
+    field.name for field in co_arrow_schema if field.type == pa.list_(pa.bool_())
+]
+
+CO_TYPE_MAP = {
+    "nested_double": co_nested_arr_cols,
+    "double_array": co_double_arr_cols,
+    "int_array": co_int_arr_cols,
+    "str_array": co_str_arr_cols,
+    "bool_array": co_bool_arr_cols,
 }
 
 
-@sf.udf(returnType=ArrayType(DoubleType()))
-def str_to_arrayof_double(val):
-    if val is None:
-        return None
-    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
-        return literal_eval(val)
-    raise ValueError(f"Error converting {val} to list")
+def transform_table_arrays(table, col_type_map):
+    """Transform string columns to array columns based on type mapping"""
+    arrays = []
+    names = []
+    for col_name in table.column_names:
+        col_array = table.column(col_name)
+        names.append(col_name)
+        if col_name in col_type_map.get("nested_double", []):
+            pylist = col_array.to_pylist()
+            transformed_list = [str_to_nestedarrayof_double(val) for val in pylist]
+            nested_double_type = pa.list_(pa.list_(pa.float64()))
+            arrays.append(pa.array(transformed_list, type=nested_double_type))
+        elif col_name in col_type_map.get("double_array", []):
+            pylist = col_array.to_pylist()
+            transformed_list = [str_to_arrayof_double(val) for val in pylist]
+            arrays.append(pa.array(transformed_list, type=pa.list_(pa.float64())))
+        elif col_name in col_type_map.get("int_array", []):
+            pylist = col_array.to_pylist()
+            transformed_list = [str_to_arrayof_int(val) for val in pylist]
+            arrays.append(pa.array(transformed_list, type=pa.list_(pa.int64())))
+        elif col_name in col_type_map.get("str_array", []):
+            pylist = col_array.to_pylist()
+            transformed_list = [str_to_arrayof_str(val) for val in pylist]
+            arrays.append(pa.array(transformed_list, type=pa.list_(pa.string())))
+        elif col_name in col_type_map.get("bool_array", []):
+            pylist = col_array.to_pylist()
+            transformed_list = [str_to_arrayof_bool(val) for val in pylist]
+            arrays.append(pa.array(transformed_list, type=pa.list_(pa.bool_())))
+        elif col_name in col_type_map.get("nested_int", []):
+            pylist = col_array.to_pylist()
+            transformed_list = [str_to_nestedarrayof_int(val) for val in pylist]
+            nested_int_type = pa.list_(pa.list_(pa.int64()))
+            arrays.append(pa.array(transformed_list, type=nested_int_type))
+        else:
+            arrays.append(col_array)
+    return pa.table(arrays, names=names)
 
 
-@sf.udf(returnType=ArrayType(BooleanType()))
-def str_to_arrayof_bool(val):
-    if val is None:
-        return None
-    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
-        return literal_eval(val)
-    raise ValueError(f"Error converting {val} to list")
+def get_vastdb_session():
+    endpoint = "http://10.32.38.210"
+    with open(f"/home/{os.environ['USER']}/.vast-dev/access_key_id", "r") as f:
+        access_key = f.read().rstrip("\n")
+    with open(f"/home/{os.environ['USER']}/.vast-dev/secret_access_key", "r") as f:
+        secret_key = f.read().rstrip("\n")
+    return vastdb.connect(endpoint=endpoint, access=access_key, secret=secret_key)
 
 
-@sf.udf(returnType=ArrayType(ArrayType(IntegerType())))
-def str_to_nestedarrayof_int(val):
-    if val is None:
-        return None
-    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
-        return literal_eval(val)
-    raise ValueError(f"Error converting {val} to list")
+def export_configuration_parquets(dataset_id, dataset_dir, session):
+    """
+    Export configuration parquet files using VastDB SDK
 
+    Args:
+        dataset_id: The dataset ID to export
+        dataset_dir: Directory to save the parquet files
+        session: VastDB session
+    """
+    start = time()
+    logger.info(f"Starting export for dataset: {dataset_id}")
 
-co_nested_arr_cols = [
-    col.name
-    for col in config_arr_schema
-    if col.simpleString().split(":")[1] == "array<array<double>>"
-]
-co_double_arr_cols = [
-    col.name
-    for col in config_arr_schema
-    if col.simpleString().split(":")[1] == "array<double>"
-]
-co_str_arr_cols = [
-    col.name
-    for col in config_arr_schema
-    if col.simpleString().split(":")[1] == "array<string>"
-]
-co_int_arr_cols = [
-    col.name
-    for col in config_arr_schema
-    if col.simpleString().split(":")[1] == "array<int>"
-]
-co_bool_arr_cols = [
-    col.name
-    for col in config_arr_schema
-    if col.simpleString().split(":")[1] == "array<boolean>"
-]
-ds_double_arr_cols = [
-    col.name
-    for col in dataset_arr_schema
-    if col.simpleString().split(":")[1] == "array<double>"
-]
-ds_str_arr_cols = [
-    col.name
-    for col in dataset_arr_schema
-    if col.simpleString().split(":")[1] == "array<string>"
-]
-ds_int_arr_cols = [
-    col.name
-    for col in dataset_arr_schema
-    if col.simpleString().split(":")[1] == "array<int>"
-]
-ds_nested_intarr_cols = [
-    col.name
-    for col in dataset_arr_schema
-    if col.simpleString().split(":")[1] == "array<array<int>>"
-]
+    co_output_path = dataset_dir / "co"
+    co_output_path.mkdir(parents=True, exist_ok=True)
 
-cs_double_arr_cols = [
-    col.name
-    for col in configuration_set_arr_schema
-    if col.simpleString().split(":")[1] == "array<double>"
-]
-cs_str_arr_cols = [
-    col.name
-    for col in configuration_set_arr_schema
-    if col.simpleString().split(":")[1] == "array<string>"
-]
-cs_int_arr_cols = [
-    col.name
-    for col in configuration_set_arr_schema
-    if col.simpleString().split(":")[1] == "array<int>"
-]
-cs_nested_intarr_cols = [
-    col.name
-    for col in configuration_set_arr_schema
-    if col.simpleString().split(":")[1] == "array<array<int>>"
-]
-
-
-def get_cos(dataset_id, nconfigs):
-    co_columns = spark.table("ndb.`colabfit-prod`.prod.co").columns
-    logger.info(f"co_columns: {co_columns}")
-
-    co_type_map = {
-        "nested_double": co_nested_arr_cols,
-        "int_array": co_int_arr_cols,
-        "str_array": co_str_arr_cols,
-        "double_array": co_double_arr_cols,
-        "bool_array": co_bool_arr_cols,
-    }
-    co_dir = f"{parquet_directory}/{dataset_id}"
-    transformed_cols = [
-        create_column_transformer(col, co_type_map) for col in co_columns
-    ]
-    co_ids = spark.read.parquet(f"{co_dir}/co_ids.parquet")
-    # cos = (
-    #     spark.table("ndb.`colabfit-prod`.prod.co")
-    #     .filter(sf.col("dataset_ids").contains(dataset_id))
-    #     .select(transformed_cols)
-    # )
-    cos = co_ids.join(spark.table("ndb.`colabfit-prod`.prod.co"), on="id", how="inner")
-    cos = cos.select(transformed_cols)
-    if cos.filter("metadata_path is not null").count() > 0:
-        metadata_udf = create_metadata_reader_udf(config)
-        cos = cos.withColumn("metadata", metadata_udf(sf.col("metadata_path")))
-    else:
-        cos = cos.withColumn("metadata", sf.lit(None).cast(StringType()))
-    cos_save_path = Path(f"{co_dir}/co.parquet")
-    n_partitions = max(1, nconfigs // 100000)
-    cos.coalesce(n_partitions).write.parquet(str(cos_save_path))
-    logger.info(f"Saved COs for {dataset_id} to {cos_save_path}")
-    # delete coids file
-    for file in Path(f"{co_dir}/co_ids.parquet").glob("*"):
-        if file.is_file():
-            file.unlink()
-    Path(f"{co_dir}/co_ids.parquet").rmdir(missing_ok=True)
-
-
-def get_pos(dataset_id, nconfigs):
-    logger.info(f"Processing property objects for dataset {dataset_id}")
-    po_arr_cols = [
-        field.name
-        for field in property_object_arr_schema
-        if field.dataType.typeName() == "array"
-    ]
-    po_type_map = {
-        "nested_double": po_arr_cols,
-    }
-    pos_columns = spark.table("ndb.`colabfit-prod`.prod.po").columns
-    transformed_cols = [
-        create_column_transformer(col, po_type_map)
-        for col in property_object_arr_schema.fieldNames()
-        if (col != "metadata" and col in pos_columns)
-    ]
-    pos = (
-        spark.table("ndb.`colabfit-prod`.prod.po")
-        .filter(sf.col("dataset_id") == dataset_id)
-        .select(transformed_cols)
+    predicate = _.dataset_id == dataset_id
+    batch_count, file_count, total_rows = _export_configs(
+        predicate, co_output_path, session, 0
     )
-    po_dir = f"{parquet_directory}/{dataset_id}"
-    metadata_udf = create_metadata_reader_udf(config)
-    pos = pos.withColumn("metadata", metadata_udf(sf.col("metadata_path")))
-    logger.info(f"pos columns: {pos.columns}")
-    pos_save_path = Path(f"{po_dir}/po.parquet")
-    n_partitions = max(1, nconfigs // 100000)
-    pos.repartition(n_partitions).write.parquet(str(pos_save_path))
-    logger.info(f"Saved PO for {dataset_id} to {pos_save_path}")
-    pos.select("configuration_id").withColumnRenamed(
-        "configuration_id", "id"
-    ).write.parquet(f"{po_dir}/co_ids.parquet")
 
-
-def get_dataset(dataset_id):
-    ds = spark.table("ndb.`colabfit-prod`.prod.ds").filter(sf.col("id") == dataset_id)
-    if ds is None:
-        logger.warning(f"Dataset {dataset_id} not found in prod.ds")
-        return None
-    ds_type_map = {
-        "int_array": ds_int_arr_cols,
-        "str_array": ds_str_arr_cols,
-        "double_array": ds_double_arr_cols,
-        "nested_int": ds_nested_intarr_cols,
-    }
-    transformed_cols = [
-        create_column_transformer(col, ds_type_map) for col in ds.columns
-    ]
-    ds_dir = f"{parquet_directory}/{dataset_id}"
-    ds = ds.select(transformed_cols)
-    ds.write.mode("overwrite").json(f"{ds_dir}/ds.json")
-    logger.info(f"Saved DS for {dataset_id} to {ds_dir}/ds.json")
-    return ds.select("nconfigurations").first()["nconfigurations"]
-
-
-def get_configuration_sets(dataset_id):
-    cs = spark.table("ndb.`colabfit-prod`.prod.cs").filter(
-        sf.col("dataset_id") == dataset_id
-    )
-    if cs.count() == 0:
-        logger.info(f"No configuration sets found for dataset {dataset_id}")
-        return None
-
-    cs_type_map = {
-        "int_array": cs_int_arr_cols,
-        "str_array": cs_str_arr_cols,
-        "double_array": cs_double_arr_cols,
-        "nested_int": cs_nested_intarr_cols,
-    }
-    transformed_cols = [
-        create_column_transformer(col, cs_type_map) for col in cs.columns
-    ]
-    cs_dir = f"{parquet_directory}/{dataset_id}"
-    cs = cs.select(transformed_cols)
-    cs.write.mode("overwrite").parquet(f"{cs_dir}/cs.parquet")
-    logger.info(f"Saved CS for {dataset_id} to {cs_dir}/cs.parquet")
-    return cs.select("id")
-
-
-def get_cs_co_mapping(dataset_id, ids):
-    cs_co_map = spark.table("ndb.`colabfit-prod`.prod.cs_co_map").join(
-        ids, sf.col("configuration_set_id") == sf.col("id"), "inner"
-    )
-    cs_co_dir = f"{parquet_directory}/{dataset_id}"
-    cs_co_map.write.parquet(f"{cs_co_dir}/cs_co_map.parquet")
     logger.info(
-        f"Saved CS-CO mapping for {dataset_id} to {cs_co_dir}/cs_co_map.parquet"
+        f"CO processing complete: {batch_count} batches, {total_rows} total rows"
     )
+    logger.info(f"CO export took {time() - start:.2f} seconds")
+
+    if batch_count == 0:
+        logger.warning(f"No CO batches found for dataset {dataset_id}")
+    if total_rows == 0:
+        logger.warning(f"No CO rows found for dataset {dataset_id}")
 
 
-def process_dataset(dataset_id):
-    logger.info(f"Processing dataset {dataset_id}")
-    Path(dataset_id).mkdir(parents=True, exist_ok=True)
-    if (Path(dataset_id) / "po.parquet").exists():
-        logger.info(f"PO files for {dataset_id} already exist")
+def _export_configs(predicate, co_output_path, session, initial_file_count):
+
+    with session.transaction() as tx:
+        co_table = (
+            tx.bucket("colabfit-prod").schema("prod").table("co_po_merged_innerjoin")
+        )
+        co_data = co_table.select(predicate=predicate)
+        batch_count = 0
+        file_rows = 0
+        file_tables = []
+        file_row_size = CONFIG["FILE_ROW_LIMIT"]
+        file_count = initial_file_count
+        total_rows = 0
+        try:
+            managed_batches = batch_manager(
+                co_data, target_batch_size=CONFIG["CO_BATCH_SIZE"]
+            )
+            for i, co_batch in enumerate(managed_batches):
+                batch_count += 1
+                batch_rows = co_batch.num_rows
+                total_rows += batch_rows
+                file_rows += batch_rows
+                logger.info(f"Read CO batch {i}: {batch_rows} rows")
+                if batch_rows == 0:
+                    logger.warning(f"CO batch {i} is empty, skipping")
+                    continue
+                co_data_transformed = transform_table_arrays(co_batch, CO_TYPE_MAP)
+                co_data_transformed = read_metadata_column(co_data_transformed)
+                file_tables.append(co_data_transformed)
+
+                if file_rows >= file_row_size:
+                    file_table = pa.concat_tables(file_tables)
+                    file_tables = []
+                    output_file = co_output_path / f"co_{file_count}.parquet"
+                    logger.info(f"Saving CO batch {file_count} to {output_file}")
+                    write_parquet_file(
+                        file_table, output_file, CONFIG["COMPRESSION_LEVEL"]
+                    )
+                    logger.info(f"Successfully saved CO batch {file_count}")
+                    file_count += 1
+                    file_rows = 0
+            if file_tables:
+                file_table = pa.concat_tables(file_tables)
+                file_tables = []
+                output_file = co_output_path / f"co_{file_count}.parquet"
+                logger.info(f"Saving final CO batch {file_count} to {output_file}")
+                write_parquet_file(
+                    file_table, output_file, CONFIG["COMPRESSION_LEVEL"]
+                )
+                logger.info(f"Successfully saved final CO batch {file_count}")
+
+        except Exception as e:
+            logger.error(f"Error processing CO data: {e}")
+            raise
+    return batch_count, file_count, total_rows
+
+
+def export_configurations_in_batches(dataset_id, dataset_dir, session):
+    """
+    Export configuration parquet files using VastDB SDK in batches
+
+    Args:
+        dataset_id: The dataset ID to export
+        output_dir: Directory to save the parquet files
+    """
+    start = time()
+    logger.info(f"Starting export for dataset: {dataset_id}")
+
+    co_output_path = dataset_dir / "co"
+    co_output_path.mkdir(parents=True, exist_ok=True)
+    total_batch_count = 0
+    total_rows = 0
+    prefix_div = [f"PO_{i:02d}" for i in range(10, 100)]
+    file_count = 0
+    for prefix in prefix_div:
+        logger.info(f"Processing prefix: {prefix} for dataset: {dataset_id}")
+        predicate = (_.dataset_id == dataset_id) & (_.property_id.startswith(prefix))
+        batch_count, file_count, batch_rows = _export_configs(
+            predicate, co_output_path, session, file_count
+        )
+        total_batch_count += batch_count
+        total_rows += batch_rows
+        logger.info("CO processing complete")
+        logger.info(f"Prefix {prefix}: {batch_count} batches, {batch_rows} total rows")
+
+    logger.info(f"CO export took {time() - start:.2f} seconds")
+
+
+def export_configuration_sets(dataset_id, dataset_dir, session):
+    cs_dir_made = False
+    cs_dir = dataset_dir / "cs"
+    cs_ids_all = []
+    with session.transaction() as tx:
+        cs_table = (
+            tx.bucket("colabfit-prod").schema("prod").table("configuration_set_arrays")
+        )
+        cs_data = cs_table.select(predicate=cs_table["dataset_id"] == dataset_id)
+        for i, batch in enumerate(
+            batch_manager(cs_data, target_batch_size=CONFIG["CS_BATCH_SIZE"])
+        ):
+            logger.info(f"Read CS batch {i}: {batch.num_rows} rows")
+            if batch.num_rows == 0:
+                logger.warning(f"CS batch {i} is empty, skipping")
+                continue
+            if not cs_dir_made:
+                cs_dir.mkdir(parents=True, exist_ok=True)
+                cs_dir_made = True
+            cs_output_path = cs_dir / f"cs_{i}.parquet"
+            write_parquet_file(batch, cs_output_path, CONFIG["COMPRESSION_LEVEL"])
+            logger.info(f"Saved CS data to: {cs_output_path}")
+
+            cs_ids = batch.column("id").to_pylist()
+            cs_ids_all.extend(cs_ids)
+    return cs_ids_all
+
+
+def export_cs_co_mapping(cs_ids_all, dataset_dir, session):
+    if not cs_ids_all:
         return
-    nconfigs = get_dataset(dataset_id)
-    get_pos(dataset_id, nconfigs)
-    get_cos(dataset_id, nconfigs)
-    cs_ids = get_configuration_sets(dataset_id)
-    if cs_ids is not None:
-        get_cs_co_mapping(dataset_id, cs_ids)
+
+    cs_co_map_dir = dataset_dir / "cs_co_map"
+    cs_co_map_dir.mkdir(parents=True, exist_ok=True)
+
+    batch_size = CONFIG["CSCO_BATCH_SIZE"]
+    file_count = 0
+    file_tables = []
+    file_rows = 0
+
+    with session.transaction() as tx:
+        cs_co_map_table = tx.bucket("colabfit-prod").schema("prod").table("cs_co_map")
+
+        for i in range(0, len(cs_ids_all), batch_size):
+            cs_id_batch = cs_ids_all[i : i + batch_size]  # noqa: E203
+            cs_co_map_data = cs_co_map_table.select(
+                predicate=cs_co_map_table["configuration_set_id"].isin(cs_id_batch)
+            ).read_all()
+
+            logger.info(f"Read CS-CO mapping batch: {cs_co_map_data.num_rows} rows")
+            file_tables.append(cs_co_map_data)
+            file_rows += cs_co_map_data.num_rows
+
+            if file_rows >= CONFIG["FILE_ROW_LIMIT"]:
+                output_file = cs_co_map_dir / f"cs_co_map_{file_count}.parquet"
+                write_parquet_file(pa.concat_tables(file_tables), output_file)
+                file_tables = []
+                file_rows = 0
+                file_count += 1
+
+        if file_tables:
+            output_file = cs_co_map_dir / f"cs_co_map_{file_count}.parquet"
+            write_parquet_file(pa.concat_tables(file_tables), output_file)
 
 
-def sort_ids_by_nconfigs(id_file):
-    ds_ids = [
-        x["id"]
-        for x in spark.table("ndb.`colabfit-prod`.prod.ds")
-        .select("id", "nconfigurations")
-        .sort("nconfigurations", ascending=False)
-        .collect()
-    ]
+def get_dataset_data(dataset_id, session):
+    with session.transaction() as tx:
+        ds_table = tx.bucket("colabfit-prod").schema("prod").table("dataset_arrays")
+        ds_data = ds_table.select(predicate=ds_table["id"] == dataset_id)
+        ds_data = ds_data.read_all()
+        logger.info(f"Read DS rows: {ds_data.num_rows}")
+    return ds_data
+
+
+def write_dataset_parquet(ds_data, dataset_dir):
+    if ds_data.num_rows > 0:
+        ds_output_path = dataset_dir / "ds.parquet"
+        write_parquet_file(ds_data, ds_output_path, CONFIG["COMPRESSION_LEVEL"])
+        logger.info(f"Saved DS data to: {ds_output_path}")
+
+
+def process_datasets_from_file(id_file, index):
+    """
+    Process multiple datasets from a file containing dataset IDs
+
+    Args:
+        id_file: Path to file containing dataset IDs (one per line)
+        output_dir: Directory to save the parquet files
+    """
+    logger.info(f"Processing datasets from file: {id_file}")
+    start = time()
+    output_dir = Path().cwd()
     with open(id_file, "r") as f:
-        dataset_ids = [line.strip() for line in f.readlines()]
-    return [id for id in ds_ids if id in dataset_ids]
+        dataset_ids = [line.strip() for line in f.readlines() if line.strip()][index:]
 
+    logger.info(f"Found {len(dataset_ids)} datasets to process")
 
-def main(id_file):
-    logger.info(f"Starting processing for dataset IDs from {id_file}")
-    dataset_ids = sort_ids_by_nconfigs(id_file)
-    for dataset_id in dataset_ids:
-        process_dataset(dataset_id)
-
-
-def main2(ds_ids):
-    for dataset_id in ds_ids:
-        process_dataset(dataset_id)
+    for i, dataset_id in enumerate(dataset_ids, 1):
+        logger.info(f"Processing dataset {i}/{len(dataset_ids)}: {dataset_id}")
+        try:
+            dataset_dir = Path(output_dir) / dataset_id
+            if dataset_dir.exists():
+                logger.info(f"Dataset {dataset_id} already exported, skipping")
+                continue
+            possible_tar_file = Path("tarfiles") / f"{dataset_id}.tar.gz"
+            if possible_tar_file.exists():
+                logger.info(f"Dataset {dataset_id} tar file already exists, skipping")
+                continue
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+            session = get_vastdb_session()
+            ds_data = get_dataset_data(dataset_id, session)
+            nconfigs = ds_data.column("nconfigurations")[0].as_py()
+            if nconfigs > CONFIG["LARGE_DATASET_THRESHOLD"]:
+                logger.info(
+                    f"Dataset {dataset_id} has {nconfigs} configurations. "
+                    "Using batches."
+                )
+                export_configurations_in_batches(dataset_id, dataset_dir, session)
+            else:
+                logger.info(
+                    f"Dataset {dataset_id} has {nconfigs} configurations. "
+                    "Selecting all at once."
+                )
+                export_configuration_parquets(dataset_id, dataset_dir, session)
+            cs_ids_all = export_configuration_sets(dataset_id, dataset_dir, session)
+            if cs_ids_all:
+                export_cs_co_mapping(cs_ids_all, dataset_dir, session)
+            write_dataset_parquet(ds_data, dataset_dir)
+        except Exception as e:
+            logger.error(f"Error processing dataset {dataset_id}: {str(e)}")
+            continue
+    logger.info(
+        f"Export completed for dataset {dataset_id} in {time() - start:.2f} seconds"
+    )
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python recalculate_ds.py <dataset_id_file>")
+    if len(sys.argv) < 2:
+        print("Usage: python export_parquets_sdk.py <dataset_id_or_file> <index>")
+        print(
+            "  dataset_id_or_file: Single dataset ID or path to file with "
+            "dataset IDs"
+        )
         sys.exit(1)
-    id_file = sys.argv[1]
-    main(id_file)
+
+    input_arg = sys.argv[1]
+    index = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    if Path(input_arg).is_file():
+        process_datasets_from_file(input_arg, index)
