@@ -1,5 +1,6 @@
 import logging
 import math
+import numbers
 import os
 import sys
 import threading
@@ -223,7 +224,8 @@ def read_metadata_column(table: pa.Table):
         config_metadata_array,
     )
     table = table.append_column(
-        pa.field("property_metadata", pa.string(), nullable=True), prop_metadata_array
+        pa.field("property_metadata", pa.string(), nullable=True),
+        prop_metadata_array,
     )
     logger.info(f"MD ops finished in {time() - start_md:.2f} seconds")
     return table
@@ -543,7 +545,7 @@ def export_configurations_in_batches(dataset_id, dataset_dir, session):
 
 
 def export_configuration_sets(dataset_id, dataset_dir, session):
-    cs_dir_created = False
+    cs_dir_made = False
     cs_dir = dataset_dir / "cs"
     cs_ids_all = []
     with session.transaction() as tx:
@@ -558,9 +560,9 @@ def export_configuration_sets(dataset_id, dataset_dir, session):
             if batch.num_rows == 0:
                 logger.warning(f"CS batch {i} is empty, skipping")
                 continue
-            if not cs_dir_created:
+            if not cs_dir_made:
                 cs_dir.mkdir(parents=True, exist_ok=True)
-                cs_dir_created = True
+                cs_dir_made = True
             cs_output_path = cs_dir / f"cs_{i}.parquet"
             write_parquet_file(batch, cs_output_path, CONFIG["COMPRESSION_LEVEL"])
             logger.info(f"Saved CS data to: {cs_output_path}")
@@ -627,10 +629,212 @@ def get_dataset_data(dataset_id, session):
 
 
 def write_dataset_parquet(ds_data, dataset_dir):
-    if ds_data.num_rows > 0:
-        ds_output_path = dataset_dir / "ds.parquet"
-        write_parquet_file(ds_data, ds_output_path, CONFIG["COMPRESSION_LEVEL"])
-        logger.info(f"Saved DS data to: {ds_output_path}")
+    ds_output_path = dataset_dir / "ds.parquet"
+    write_parquet_file(ds_data, ds_output_path, CONFIG["COMPRESSION_LEVEL"])
+    logger.info(f"Saved DS data to: {ds_output_path}")
+
+
+def generate_dataset_citation_string(item):
+    def _ensure_list(value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            try:
+                return literal_eval(value)
+            except (ValueError, SyntaxError):
+                return [value]
+        return value
+
+    logger.info(f"Generating citation for dataset {item['id']}")
+    joined_names_string = None
+    joined_names = []
+
+    for author in _ensure_list(item["authors"]):
+        name_parts_orig = author.split(" ")
+        name_parts_new = []
+        family_name = name_parts_orig.pop()
+        for name_part in name_parts_orig:
+            if name_part[0].islower():
+                continue
+            s = name_part[0] + "."
+            name_parts_new.append(s)
+
+        formatted_name = family_name + ", " + " ".join(name_parts_new)
+        joined_names.append(formatted_name)
+
+    if len(joined_names) > 1:
+        joined_names[-1] = "and " + joined_names[-1]
+
+    joined_names_string = ", ".join(joined_names)
+    item_name_converted = item["name"].replace("_", " ")
+    citation_string = (
+        f"{joined_names_string} _{item_name_converted}_. ColabFit, "
+        f"{item['publication_year']}. https://doi.org/{item['doi']}"
+    )
+    return citation_string
+
+
+def write_dataset_readme(dataset_dir, ds_row):
+    def _ensure_list(value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            try:
+                return literal_eval(value)
+            except (ValueError, SyntaxError):
+                return [value]
+        return value
+
+    def _ensure_dict(value):
+        if value is None:
+            return {}
+        if isinstance(value, str):
+            try:
+                parsed = literal_eval(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except (ValueError, SyntaxError):
+                return {}
+        return value
+
+    elements = ", ".join(_ensure_list(ds_row["elements"]))
+    dslicense = ds_row["license"]
+    links = _ensure_dict(ds_row["links"])
+    properties_cols = ", ".join(
+        [
+            col.replace("_count", "").replace("_", " ")
+            for col, value in ds_row.items()
+            if col.endswith("count") and isinstance(value, numbers.Number) and value
+        ]
+    )
+
+    citation = generate_dataset_citation_string(ds_row)
+    dataset_name = ds_row["name"].replace("_", " ")
+
+    text = (
+        "---\n"
+        "configs:\n"
+        "- config_name: info\n"
+        '  data_files: "ds.parquet"\n'
+        "- config_name: main\n"
+        '  data_files: "co/*.parquet"\n'
+        "- config_name: configuration_sets\n"
+        '  data_files: "cs/*.parquet"\n'
+        "- config_name: config_set_mapping\n"
+        '  data_files: "cs_co_map/*.parquet"\n'
+        "license: {license}\n"
+        "tags:\n"
+        "- molecular dynamics\n"
+        "- mlip\n"
+        "- interatomic potential\n"
+        "pretty_name: {pretty_name}\n"
+        "---\n"
+    ).format(license=dslicense.lower().replace("-only", ""), pretty_name=dataset_name)
+
+    text += (
+        f"### Cite this dataset  \n{citation}\n  "
+        "##### This dataset has been curated and formatted for the ColabFit Exchange  \n"  # noqa: E501
+        f"##### View this dataset on the ColabFit Exchange:  https://materials.colabfit.org/id/{ds_row['id']}  \n"  # noqa: E501
+        "##### [Visit the ColabFit Exchange](https://materials.colabfit.org) to search additional datasets by author, description, element content and more.  \n<br>"  # noqa: E501
+        "<hr>  \n"
+        f"# Dataset  Name  \n{dataset_name}  \n"
+        f"### Description  \n{ds_row['description']}  \n<br>"
+        "Aggregated dataset details are stored in /info/ds.parquet  \n"
+        "### Dataset authors  \n"
+        f"{', '.join(_ensure_list(ds_row['authors']))}  \n"
+    )
+    source_publication = links.get("source-publication")
+    if source_publication:
+        text += f"### Publication  \n{source_publication}  \n"
+    source_data = links.get("source-data")
+    if source_data:
+        text += f"### Original data link \n{source_data}  \n"
+    text += (
+        f"### License  \n{dslicense}  \n"
+        "### Number of unique molecular configurations  \n"
+        f"{ds_row['nconfigurations']}  \n"
+        f"### Number of atoms  \n{ds_row['nsites']}  \n"
+        f"### Elements included  \n{elements}  \n"
+        f"### Properties included  \n{properties_cols}  \n<br>\n"
+        "<hr>  \n\n"
+        "# Usage  \n"
+        "Aggregated dataset information is viewable in the file `ds.parquet`.  \n"
+        "Configuration sets are subsets of configurations grouped by some common characteristic. If these have been defined for this dataset, they are viewable in the `cs/` directory.  \n"  # noqa: E501
+        "The mapping of configurations to configuration sets (if defined) is viewable in the `cs_co_map/` directory.  \n<br>\n"  # noqa: E501
+        "##### Additional information, including example code for parsing parquet files, including selection of configurations by configuration set, is available in the ColabFit Exchange documentation:  \n"  # noqa: E501
+        "- [ColabFit parquet file documentation](https://materials.colabfit.org/docs/how_to_use_parquet)  \n"  # noqa: E501
+        "- [Dataset info schema](https://materials.colabfit.org/docs/dataset_schema)  \n"  # noqa: E501
+        "- [Configuration schema](https://materials.colabfit.org/docs/configuration_schema)  \n"  # noqa: E501
+        "- [Configuration set schema](https://materials.colabfit.org/docs/configuration_set_schema)  \n"  # noqa: E501
+        "- [Configuration set to configuration mapping schema](https://materials.colabfit.org/docs/cs_co_mapping_schema)  \n"  # noqa: E501
+    )
+
+    with open(dataset_dir / "README.md", "w") as f:
+        f.write(text)
+    logger.info("README written")
+
+
+def process_dataset(dataset_id, dataset_dir, session):
+    ds_data = get_dataset_data(dataset_id, session)
+    ds_row = ds_data.to_pylist()[0]
+    if ds_data.num_rows == 0:
+        logger.warning(f"Dataset {dataset_id} has no dataset rows")
+        return
+    write_dataset_parquet(ds_data, dataset_dir)
+
+    nconfigs = ds_row["nconfigurations"]
+    if nconfigs > CONFIG["LARGE_DATASET_THRESHOLD"]:
+        logger.info(
+            f"Dataset {dataset_id} has {nconfigs} configurations. Using batches."
+        )
+        export_configurations_in_batches(dataset_id, dataset_dir, session)
+        logger.info("Completed CO export in batches. Moving all CO files to co/")
+        move_finished_co_files(dataset_dir)
+
+    else:
+        logger.info(
+            f"Dataset {dataset_id} has {nconfigs} configurations. "
+            "Selecting all at once."
+        )
+        export_configuration_parquets(dataset_id, dataset_dir, session)
+
+    cs_ids_all = export_configuration_sets(dataset_id, dataset_dir, session)
+    if cs_ids_all:
+        export_cs_co_mapping(cs_ids_all, dataset_dir, session)
+
+    write_dataset_readme(dataset_dir, ds_row)
+
+
+def get_dsid_from_csv(id_file, index):
+    with open(id_file, "r") as f:
+        _ = f.readline()
+        dataset_ids = [
+            line.strip().split(",")[0] for line in f.readlines() if line.strip()
+        ]
+    logger.info(
+        f"Total datasets in file: {len(dataset_ids)}, starting from index: {index}"
+    )
+    if index >= len(dataset_ids):
+        logger.warning(
+            f"Index {index} is beyond dataset list length {len(dataset_ids)}"
+        )
+        return []
+    return dataset_ids[index:]
+
+
+def move_finished_co_files(dataset_dir):
+    co_dir = dataset_dir / "co"
+    co_batch_paths = sorted(list(co_dir.rglob("*.parquet")))
+    for batch_path in co_batch_paths:
+        final_path = co_dir / batch_path.name
+        if batch_path != final_path:
+            batch_path.rename(final_path)
+    for subdir in co_dir.iterdir():
+        if subdir.is_dir():
+            try:
+                subdir.rmdir()
+                logger.info(f"Removed empty directory: {subdir}")
+            except OSError as e:
+                logger.warning(f"Could not remove directory {subdir}: {e}")
 
 
 def process_datasets_from_file(id_file, index):
@@ -639,74 +843,62 @@ def process_datasets_from_file(id_file, index):
 
     Args:
         id_file: Path to file containing dataset IDs (one per line)
-        output_dir: Directory to save the parquet files
+        index: Starting index in the dataset list
     """
-    logger.info(f"Processing datasets from file: {id_file}")
+    logger.info(f"Processing datasets from file: {id_file}, starting at index: {index}")
     start = time()
     output_dir = Path().cwd()
-    with open(id_file, "r") as f:
-        dataset_ids = [line.strip() for line in f.readlines() if line.strip()][index:]
+    dataset_ids = get_dsid_from_csv(id_file, index)
 
-    logger.info(f"Found {len(dataset_ids)} datasets to process")
+    logger.info(
+        f"Found {len(dataset_ids)} datasets to process starting from index {index}"
+    )
 
     for i, dataset_id in enumerate(dataset_ids, 1):
         logger.info(f"Processing dataset {i}/{len(dataset_ids)}: {dataset_id}")
-        try:
-            dataset_dir = Path(output_dir) / dataset_id
-            if (dataset_dir / "ds.parquet").exists():
-                logger.info(f"Dataset {dataset_id} already exported, skipping")
-                continue
-            possible_tar_file = Path("tarfiles") / f"{dataset_id}.tar.gz"
-            if possible_tar_file.exists():
-                logger.info(f"Dataset {dataset_id} tar file already exists, skipping")
-                continue
-            dataset_dir.mkdir(parents=True, exist_ok=True)
-            session = get_vastdb_session()
-            ds_data = get_dataset_data(dataset_id, session)
-            nconfigs = ds_data.column("nconfigurations")[0].as_py()
-            if nconfigs > CONFIG["LARGE_DATASET_THRESHOLD"]:
-                logger.info(
-                    f"Dataset {dataset_id} has {nconfigs} configurations. "
-                    "Using batches."
-                )
-                export_configurations_in_batches(dataset_id, dataset_dir, session)
-                logger.info(
-                    "Completed CO export in batches. Moving all CO files to co/"
-                )
-                co_dir = dataset_dir / "co"
-                co_batch_paths = sorted(list(co_dir.rglob("*.parquet")))
-                for batch_path in co_batch_paths:
-                    final_path = co_dir / batch_path.name
-                    if batch_path != final_path:
-                        batch_path.rename(final_path)
-                for subdir in co_dir.iterdir():
-                    if subdir.is_dir():
-                        try:
-                            subdir.rmdir()
-                            logger.info(f"Removed empty directory: {subdir}")
-                        except OSError as e:
-                            logger.warning(f"Could not remove directory {subdir}: {e}")
-            else:
-                logger.info(
-                    f"Dataset {dataset_id} has {nconfigs} configurations. "
-                    "Selecting all at once."
-                )
-                export_configuration_parquets(dataset_id, dataset_dir, session)
-            cs_ids_all = export_configuration_sets(dataset_id, dataset_dir, session)
-            if cs_ids_all:
-                export_cs_co_mapping(cs_ids_all, dataset_dir, session)
-            write_dataset_parquet(ds_data, dataset_dir)
-        except Exception as e:
-            logger.error(f"Error processing dataset {dataset_id}: {str(e)}")
+        # try:
+        dataset_dir = Path(output_dir) / dataset_id
+        if (dataset_dir / "ds.parquet").exists():
+            logger.info(f"Dataset {dataset_id} already exported, skipping")
             continue
+        possible_tar_file = Path("tarfiles") / f"{dataset_id}.tar.gz"
+        if possible_tar_file.exists():
+            logger.info(f"Dataset {dataset_id} tar file already exists, skipping")
+            continue
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        session = get_vastdb_session()
+        ds_data = get_dataset_data(dataset_id, session)
+        ds_row = ds_data.to_pylist()[0]
+        nconfigs = ds_row["nconfigurations"]
+        if nconfigs > CONFIG["LARGE_DATASET_THRESHOLD"]:
+            logger.info(
+                f"Dataset {dataset_id} has {nconfigs} configurations. " "Using batches."
+            )
+            export_configurations_in_batches(dataset_id, dataset_dir, session)
+            logger.info("Completed CO export in batches. Moving all CO files to co/")
+            move_finished_co_files(dataset_dir)
+        else:
+            logger.info(
+                f"Dataset {dataset_id} has {nconfigs} configurations. "
+                "Selecting all at once."
+            )
+            export_configuration_parquets(dataset_id, dataset_dir, session)
+        cs_ids_all = export_configuration_sets(dataset_id, dataset_dir, session)
+        if cs_ids_all:
+            export_cs_co_mapping(cs_ids_all, dataset_dir, session)
+        write_dataset_parquet(ds_data, dataset_dir)
+        write_dataset_readme(dataset_dir, ds_row)
+        # except Exception as e:
+        #     logger.error(f"Error processing dataset {dataset_id}: {str(e)}")
+        #     continue
     logger.info(
         f"Export completed for dataset {dataset_id} in {time() - start:.2f} seconds"
     )
 
 
-if __name__ == "__main__":
+def main():
     if len(sys.argv) < 2:
-        print("Usage: python export_parquets_sdk.py <dataset_id_or_file> <index>")
+        print("Usage: python export_parquets_hf.py <dataset_id_or_file> " "<index>")
         print(
             "  dataset_id_or_file: Single dataset ID or path to file with "
             "dataset IDs"
@@ -714,6 +906,21 @@ if __name__ == "__main__":
         sys.exit(1)
 
     input_arg = sys.argv[1]
-    index = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    index = int(sys.argv[2])
+    logger.info(f"Input argument: {input_arg}, starting index: {index}")
     if Path(input_arg).is_file():
+        logger.info(
+            f"Processing datasets from file: {input_arg} starting at index {index}"
+        )
         process_datasets_from_file(input_arg, index)
+    else:
+        logger.info(f"Processing single dataset: {input_arg}")
+        dataset_id = input_arg
+        dataset_dir = Path().cwd() / dataset_id
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        session = get_vastdb_session()
+        process_dataset(dataset_id, dataset_dir, session)
+
+
+if __name__ == "__main__":
+    main()
