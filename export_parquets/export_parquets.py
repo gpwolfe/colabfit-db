@@ -503,9 +503,32 @@ def export_configurations_in_batches(dataset_id, dataset_dir, session):
         co_tmp_path.mkdir(parents=True, exist_ok=True)
     total_batch_count = 0
     total_rows = 0
-    prefix_div = [f"PO_{i:02d}" for i in range(10, 100)]
+    prefix_div = [f"PO_{i:03d}" for i in range(100, 140)]
+    prefix_div += [f"PO_{i:02d}" for i in range(14, 100)]
     existing_prefix_paths = {p.name for p in co_dir.glob("PO_??")}
-    file_count = 0
+
+    # Find last file count from existing files
+    max_file_count = 0
+    for prefix_dir in co_dir.glob("PO_*"):
+        if prefix_dir.is_dir():
+            for parquet_file in prefix_dir.glob("co_*.parquet"):
+                try:
+                    file_num = int(parquet_file.stem.split("_")[1])
+                    max_file_count = max(max_file_count, file_num)
+                except (ValueError, IndexError):
+                    continue
+
+    for parquet_file in co_dir.glob("co_*.parquet"):
+        try:
+            file_num = int(parquet_file.stem.split("_")[1])
+            max_file_count = max(max_file_count, file_num)
+        except (ValueError, IndexError):
+            continue
+
+    file_count = max_file_count + 1 if max_file_count > 0 else 0
+    logger.info(
+        f"Starting file count at {file_count} (found max existing: {max_file_count})"
+    )
     for prefix in prefix_div:
         if prefix in existing_prefix_paths:
             logger.info(f"Prefix {prefix} already processed, skipping")

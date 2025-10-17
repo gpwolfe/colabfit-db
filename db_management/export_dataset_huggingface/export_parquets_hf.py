@@ -505,9 +505,32 @@ def export_configurations_in_batches(dataset_id, dataset_dir, session):
         co_tmp_path.mkdir(parents=True, exist_ok=True)
     total_batch_count = 0
     total_rows = 0
-    prefix_div = [f"PO_{i:02d}" for i in range(10, 100)]
+    prefix_div = [f"PO_{i:03d}" for i in range(100, 140)]
+    prefix_div += [f"PO_{i:02d}" for i in range(14, 100)]
     existing_prefix_paths = {p.name for p in co_dir.glob("PO_??")}
-    file_count = 0
+
+    # Find last file count from existing files
+    max_file_count = 0
+    for prefix_dir in co_dir.glob("PO_*"):
+        if prefix_dir.is_dir():
+            for parquet_file in prefix_dir.glob("co_*.parquet"):
+                try:
+                    file_num = int(parquet_file.stem.split("_")[1])
+                    max_file_count = max(max_file_count, file_num)
+                except (ValueError, IndexError):
+                    continue
+
+    for parquet_file in co_dir.glob("co_*.parquet"):
+        try:
+            file_num = int(parquet_file.stem.split("_")[1])
+            max_file_count = max(max_file_count, file_num)
+        except (ValueError, IndexError):
+            continue
+
+    file_count = max_file_count + 1 if max_file_count > 0 else 0
+    logger.info(
+        f"Starting file count at {file_count} (found max existing: {max_file_count})"
+    )
     for prefix in prefix_div:
         if prefix in existing_prefix_paths:
             logger.info(f"Prefix {prefix} already processed, skipping")
@@ -698,6 +721,10 @@ def write_dataset_readme(dataset_dir, ds_row):
 
     elements = ", ".join(_ensure_list(ds_row["elements"]))
     dslicense = ds_row["license"]
+    if dslicense.lower() == "nist-pd":
+        dslicense = "unknown"
+    if dslicense.lower() == "cc0":
+        dslicense = "cc0-1.0"
     links = _ensure_dict(ds_row["links"])
     properties_cols = ", ".join(
         [
@@ -837,7 +864,7 @@ def move_finished_co_files(dataset_dir):
                 logger.warning(f"Could not remove directory {subdir}: {e}")
 
 
-def process_datasets_from_file(id_file, index):
+def process_datasets_from_file(id_file, index, stop_ix):
     """
     Process multiple datasets from a file containing dataset IDs
 
@@ -845,10 +872,15 @@ def process_datasets_from_file(id_file, index):
         id_file: Path to file containing dataset IDs (one per line)
         index: Starting index in the dataset list
     """
-    logger.info(f"Processing datasets from file: {id_file}, starting at index: {index}")
+    logger.info(f"Processing datasets from file {id_file}, index {index} to {stop_ix}")
     start = time()
     output_dir = Path().cwd()
     dataset_ids = get_dsid_from_csv(id_file, index)
+    dataset_ids = dataset_ids[: stop_ix - index]
+    logger.info(f"Dataset IDs to process: {dataset_ids}")
+    if not dataset_ids:
+        logger.warning("No datasets to process, exiting")
+        return
 
     logger.info(
         f"Found {len(dataset_ids)} datasets to process starting from index {index}"
@@ -858,7 +890,9 @@ def process_datasets_from_file(id_file, index):
         logger.info(f"Processing dataset {i}/{len(dataset_ids)}: {dataset_id}")
         # try:
         dataset_dir = Path(output_dir) / dataset_id
-        if (dataset_dir / "ds.parquet").exists():
+        if (dataset_dir / "ds.parquet").exists() or (
+            Path("uploaded_datasets") / dataset_id
+        ).exists():  # noqa: E501
             logger.info(f"Dataset {dataset_id} already exported, skipping")
             continue
         possible_tar_file = Path("tarfiles") / f"{dataset_id}.tar.gz"
@@ -897,29 +931,12 @@ def process_datasets_from_file(id_file, index):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python export_parquets_hf.py <dataset_id_or_file> " "<index>")
-        print(
-            "  dataset_id_or_file: Single dataset ID or path to file with "
-            "dataset IDs"
-        )
-        sys.exit(1)
-
     input_arg = sys.argv[1]
     index = int(sys.argv[2])
+    stop_ix = int(sys.argv[3])
     logger.info(f"Input argument: {input_arg}, starting index: {index}")
-    if Path(input_arg).is_file():
-        logger.info(
-            f"Processing datasets from file: {input_arg} starting at index {index}"
-        )
-        process_datasets_from_file(input_arg, index)
-    else:
-        logger.info(f"Processing single dataset: {input_arg}")
-        dataset_id = input_arg
-        dataset_dir = Path().cwd() / dataset_id
-        dataset_dir.mkdir(parents=True, exist_ok=True)
-        session = get_vastdb_session()
-        process_dataset(dataset_id, dataset_dir, session)
+    logger.info(f"Stopping index: {stop_ix}")
+    process_datasets_from_file(input_arg, index, stop_ix)
 
 
 if __name__ == "__main__":
