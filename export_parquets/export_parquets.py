@@ -505,7 +505,7 @@ def export_configurations_in_batches(dataset_id, dataset_dir, session):
     total_rows = 0
     prefix_div = [f"PO_{i:03d}" for i in range(100, 140)]
     prefix_div += [f"PO_{i:02d}" for i in range(14, 100)]
-    existing_prefix_paths = {p.name for p in co_dir.glob("PO_??")}
+    existing_prefix_paths = {p.name for p in co_dir.glob("PO_*")}
 
     # Find last file count from existing files
     max_file_count = 0
@@ -552,7 +552,7 @@ def export_configurations_in_batches(dataset_id, dataset_dir, session):
 
     logger.info(f"CO export took {time() - start:.2f} seconds")
     logger.info(f"Consolidating prefix directories in {co_dir}")
-    for file in co_dir.glob("PO_??/*.parquet"):
+    for file in co_dir.glob("PO_*/*.parquet"):
         final_path = co_dir / file.name
         file.rename(final_path)
     for prefix in prefix_div:
