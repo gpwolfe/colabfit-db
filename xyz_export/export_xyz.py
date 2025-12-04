@@ -8,7 +8,6 @@ import numpy as np
 import pyarrow as pa
 from ase import Atoms
 from ase.io.extxyz import write_extxyz
-from vastdb.session import Session
 from colabfit.tools.vast.utils import get_session
 from dotenv import load_dotenv
 
@@ -162,6 +161,10 @@ class ColabfitExporter:
         logger.info(f"Exporting dataset: {dataset_id}")
         start_time = time()
         export_dir = self.export_root_dir / dataset_id
+        already_tarred_dir = self.export_root_dir / "already_tarred" / dataset_id
+        if already_tarred_dir.exists():
+            logger.info(f"Dataset {dataset_id} already exported and tarred. Skipping.")
+            return
         if export_dir.exists():
             logger.info(f"dataset dir {dataset_id} exists...")
             if (export_dir / "dataset.json").exists():
