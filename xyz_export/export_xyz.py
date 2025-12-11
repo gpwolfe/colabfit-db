@@ -10,6 +10,7 @@ from ase import Atoms
 from ase.io.extxyz import write_extxyz
 from colabfit.tools.vast.utils import get_session
 from dotenv import load_dotenv
+from ibis import _
 
 load_dotenv()
 access = os.getenv("VAST_DB_ACCESS")
@@ -78,11 +79,11 @@ class ColabfitExporter:
             ds = ds_batch_rdr.read_all().to_pylist()[0]
             return ds
 
-    def get_cos(self, dataset_id):
+    def get_cos(self, predicate):
         with get_session().transaction() as tx:
             table = tx.bucket(self.bucket).schema(self.schema).table(self.co_table)
             co_batch_rdr = table.select(
-                predicate=(table["dataset_id"] == dataset_id),
+                predicate=predicate,
                 columns=self.co_columns,
             )
             yield from self.batch_manager(co_batch_rdr)
@@ -156,7 +157,128 @@ class ColabfitExporter:
         with open(export_path, "w") as f:
             write_extxyz(f, atoms)
 
-    def export_dataset(self, dataset_id):
+    def export_dataset_prefix(self, predicate, prefix, co_tmp_dir, file_offset):
+        """Export configurations for a specific prefix"""
+        logger.info(f"Exporting prefix {prefix}")
+        co_batches = self.get_cos(predicate)
+        total_configs = 0
+        file_count = file_offset
+        for batch in co_batches:
+            atoms_batch = self.create_atoms_from_table(batch)
+            export_path = co_tmp_dir / f"co_{file_count}.extxyz"
+            self.write_atoms_to_extxyz(atoms_batch, export_path)
+            total_configs += batch.num_rows
+            file_count += 1
+            if file_count % 10 == 0:
+                logger.info(f"Processed {file_count} batches ({total_configs} configs)")
+        logger.info(f"Prefix {prefix}: {total_configs} configurations exported")
+        return file_count, total_configs
+
+    def export_dataset_in_batches(self, dataset_id):
+        """Export dataset using prefix-based batching for restartability"""
+        logger.info(f"Exporting dataset in batches: {dataset_id}")
+        start_time = time()
+        export_dir = self.export_root_dir / dataset_id
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        co_dir = export_dir / "co"
+        co_dir.mkdir(parents=True, exist_ok=True)
+
+        co_tmp_dir = co_dir / "tmp"
+        co_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        # Clean up any leftover tmp files
+        existing_tmp_files = list(co_tmp_dir.glob("*.extxyz"))
+        if existing_tmp_files:
+            logger.info(
+                f"Found {len(existing_tmp_files)} temporary files, removing them"
+            )
+            for tmp_file in existing_tmp_files:
+                tmp_file.unlink()
+
+        prefix_div = [f"PO_{i:03d}" for i in range(100, 140)]
+        prefix_div += [f"PO_{i:02d}" for i in range(14, 100)]
+
+        # Check which prefixes already exist
+        existing_prefix_paths = {p.name for p in co_dir.glob("PO_*")}
+
+        # Find last file count from existing files
+        max_file_count = 0
+        for prefix_dir in co_dir.glob("PO_*"):
+            if prefix_dir.is_dir():
+                for xyz_file in prefix_dir.glob("co_*.extxyz"):
+                    try:
+                        file_num = int(xyz_file.stem.split("_")[1])
+                        max_file_count = max(max_file_count, file_num)
+                    except (ValueError, IndexError):
+                        continue
+
+        for xyz_file in co_dir.glob("co_*.extxyz"):
+            try:
+                file_num = int(xyz_file.stem.split("_")[1])
+                max_file_count = max(max_file_count, file_num)
+            except (ValueError, IndexError):
+                continue
+
+        file_count = max_file_count + 1 if max_file_count > 0 else 0
+        logger.info(
+            f"Starting file count at {file_count} (found max existing: {max_file_count})"
+        )
+
+        total_configs = 0
+
+        for prefix in prefix_div:
+            if prefix in existing_prefix_paths:
+                logger.info(f"Prefix {prefix} already processed, skipping")
+                continue
+
+            logger.info(f"Processing prefix: {prefix} for dataset: {dataset_id}")
+
+            predicate = (_.dataset_id == dataset_id) & (
+                _.property_id.startswith(prefix)
+            )
+
+            file_count, prefix_configs = self.export_dataset_prefix(
+                predicate, prefix, co_tmp_dir, file_count
+            )
+            total_configs += prefix_configs
+
+            # Move files from tmp to prefix directory
+            co_prefix_path = co_dir / prefix
+            co_prefix_path.mkdir(parents=True, exist_ok=True)
+            for file in co_tmp_dir.glob("*.extxyz"):
+                final_path = co_prefix_path / file.name
+                file.rename(final_path)
+            logger.info(f"Moved temporary files for {prefix} to {co_prefix_path}")
+
+        logger.info(f"Export took {time() - start_time:.2f} seconds")
+        logger.info(f"Consolidating prefix directories in {co_dir}")
+
+        # Move all files from prefix dirs to co_dir
+        for file in co_dir.glob("PO_*/*.extxyz"):
+            final_path = co_dir / file.name
+            file.rename(final_path)
+
+        # Remove empty prefix directories
+        for prefix in prefix_div:
+            prefix_path = co_dir / prefix
+            if prefix_path.exists() and prefix_path.is_dir():
+                try:
+                    prefix_path.rmdir()
+                    logger.info(f"Removed empty directory: {prefix_path}")
+                except OSError as e:
+                    logger.warning(f"Could not remove directory {prefix_path}: {e}")
+
+        # Remove tmp directory
+        try:
+            co_tmp_dir.rmdir()
+            logger.info(f"Removed temporary directory: {co_tmp_dir}")
+        except OSError as e:
+            logger.warning(f"Could not remove tmp directory {co_tmp_dir}: {e}")
+
+        return total_configs
+
+    def export_dataset(self, dataset_id, large_dataset_threshold=5_000_000):
         # Create the export directory
         logger.info(f"Exporting dataset: {dataset_id}")
         start_time = time()
@@ -171,19 +293,34 @@ class ColabfitExporter:
                 logger.info(f"Dataset {dataset_id} already exported. Skipping.")
                 return
         export_dir.mkdir(parents=True, exist_ok=True)
-        co_dir = export_dir / "co"
-        co_dir.mkdir(parents=True, exist_ok=True)
+
         ds = self.get_ds(dataset_id)
-        co_batches = self.get_cos(dataset_id)
-        total_configs = 0
-        for i, batch in enumerate(co_batches):
-            atoms_batch = self.create_atoms_from_table(batch)
-            export_path = co_dir / f"co_{i}.extxyz"
-            self.write_atoms_to_extxyz(atoms_batch, export_path)
-            total_configs += batch.num_rows
-            # Log every 10 batches to reduce overhead
-            if (i + 1) % 10 == 0:
-                logger.info(f"Processed {i + 1} batches ({total_configs} configs)")
+        nconfigs = ds.get("nconfigurations", 0)
+
+        if nconfigs > large_dataset_threshold:
+            logger.info(
+                f"Dataset {dataset_id} has {nconfigs} configurations. Using prefix-based batches."
+            )
+            total_configs = self.export_dataset_in_batches(dataset_id)
+        else:
+            logger.info(
+                f"Dataset {dataset_id} has {nconfigs} configurations. Selecting all at once."
+            )
+            co_dir = export_dir / "co"
+            co_dir.mkdir(parents=True, exist_ok=True)
+
+            predicate = _.dataset_id == dataset_id
+            co_batches = self.get_cos(predicate)
+            total_configs = 0
+            for i, batch in enumerate(co_batches):
+                atoms_batch = self.create_atoms_from_table(batch)
+                export_path = co_dir / f"co_{i}.extxyz"
+                self.write_atoms_to_extxyz(atoms_batch, export_path)
+                total_configs += batch.num_rows
+                # Log every 10 batches to reduce overhead
+                if (i + 1) % 10 == 0:
+                    logger.info(f"Processed {i + 1} batches ({total_configs} configs)")
+
         logger.info(
             f"Finished exporting {total_configs} configurations "
             f"for dataset {dataset_id}"
