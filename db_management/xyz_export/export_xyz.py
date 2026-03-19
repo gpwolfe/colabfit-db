@@ -138,7 +138,9 @@ class ColabfitExporter:
 
             force_val = forces[i]
             has_forces = force_val is not None and force_val != []
-
+            has_stress = ("cauchy_stress" in info) and (info["cauchy_stress"] is not None)
+            if has_stress:
+                info["cauchy_stress"] = np.array(info["cauchy_stress"]).flatten().tolist()
             atoms = Atoms(
                 numbers=atomic_numbers[i],
                 positions=positions[i],
