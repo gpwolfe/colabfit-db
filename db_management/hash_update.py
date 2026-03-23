@@ -203,19 +203,6 @@ def update_cs_co_map(
     cs_co_map_table = (
         tx.bucket("colabfit-prod").schema("prod").table(cs_co_map_table_name)
     )
-
-    # Ensure the new table exists with the correct schema
-    try:
-        new_schema = cs_co_map_table.schema.append(
-            pa.field("new_configuration_id", pa.string())
-        )
-        tx.bucket("colabfit-prod").schema("prod").create_table(
-            new_cs_co_map_table_name, columns=new_schema, fail_if_exists=False
-        )
-        logger.info(f"Table {new_cs_co_map_table_name} ensured to exist.")
-    except Exception as e:
-        logger.info(f"Skipping creation of {new_cs_co_map_table_name}: {e}")
-
     new_cs_co_map_table = (
         tx.bucket("colabfit-prod").schema("prod").table(new_cs_co_map_table_name)
     )
@@ -223,7 +210,7 @@ def update_cs_co_map(
     # Create a dictionary for quick lookup of new_configuration_id
     processed_configs = {
         row["configuration_id"]: row["new_configuration_id"]
-        for row in table_with_hashes.to_pydict()
+        for row in table_with_hashes.to_pylist()
     }
 
     config_ids_to_lookup = list(processed_configs.keys())
@@ -249,7 +236,7 @@ def update_cs_co_map(
                     )
 
         if rows_to_insert:
-            new_cs_co_map_table.insert(rows_to_insert)
+            new_cs_co_map_table.insert(pa.Table.from_pylist(rows_to_insert))
             logger.info(
                 f"Inserted {len(rows_to_insert)} rows into {new_cs_co_map_table_name}"
             )
@@ -272,16 +259,7 @@ def append_wip_to_prod(from_table: str, to_table: str):
 prefixes = [f"PO_{n}" for n in range(1000, 1350)]
 prefixes += [f"PO_{n}" for n in range(135, 1000)]
 
-ZERO_BATCH = os.getenv("ZERO_BATCH", "false").lower() == "true"
-
-if ZERO_BATCH:
-    if TASK_ID != 0:
-        logger.info("ZERO_BATCH is true, but TASK_ID is not 0. Exiting.")
-        exit()
-    else:
-        logger.info("Running ZERO_BATCH for initial setup.")
-        prefixes = [prefixes[0]]
-elif TASK_ID >= len(prefixes):
+if TASK_ID >= len(prefixes):
     logger.error(f"TASK_ID {TASK_ID} exceeds number of prefixes {len(prefixes)}")
     raise ValueError(f"TASK_ID {TASK_ID} is out of range")
 
@@ -294,16 +272,21 @@ CS_CO_MAP_TABLE = "ndb.colabfit-prod.prod.cs_co_map"
 NEW_CS_CO_MAP_TABLE = "ndb.colabfit-prod.prod.new_cs_co_map"
 
 try:
-    # Drop the temporary table if it exists
     with get_session().transaction() as tx:
-        tx.bucket("colabfit-prod").schema("prod").table(target_table_name).drop(
-            must_exist=False
-        )
-    logger.info(f"Dropped existing temporary table {target_table_name} if it existed.")
+        sch = tx.bucket("colabfit-prod").schema("prod")
+        if sch.table(target_table_name, fail_if_missing=False):
+            sch.table(target_table_name).drop()
+            logger.info(f"Dropped existing temporary table {target_table_name}.")
+        if TASK_ID == 0:
+            cs_co_schema = sch.table(
+                CS_CO_MAP_TABLE.split(".")[-1]
+            ).arrow_schema.append(pa.field("new_configuration_id", pa.string()))
+            sch.create_table(NEW_CS_CO_MAP_TABLE.split(".")[-1], columns=cs_co_schema)
+            logger.info(f"Created {NEW_CS_CO_MAP_TABLE.split('.')[-1]}")
 
     with get_session().transaction() as tx:
         logger.info("Transaction started")
-        co_table = tx.bucket("colabfit-prod").schema("prod").table("co_with_metadata")
+        co_table = tx.bucket("colabfit-prod").schema("prod").table("co_with_metadata2")
         logger.info(f"Querying for property_id starting with {prefix}")
         reader = co_table.select(
             config=qconfig,
@@ -329,7 +312,6 @@ try:
                 sch.create_table(
                     target_table_name,
                     columns=table_with_hashes.schema,
-                    fail_if_exists=False,
                 )
 
             target_table = (
@@ -357,15 +339,13 @@ try:
         logger.info("Nothing to append; exiting.")
     else:
         logger.info(f"Appending {prefix} to production table")
-        try:
+        if TASK_ID == 0:
             with get_session().transaction() as tx:
-                tx.bucket("colabfit-prod").schema("prod").create_table(
+                sch = tx.bucket("colabfit-prod").schema("prod")
+                sch.create_table(
                     PROD_TABLE.split(".")[-1],
                     columns=table_with_hashes.schema,
-                    fail_if_exists=False,
                 )
-        except Exception as e:
-            logger.info(f"Production table creation skipped: {e}")
 
         append_wip_to_prod(f"ndb.colabfit-prod.prod.{target_table_name}", PROD_TABLE)
 
