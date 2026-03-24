@@ -266,10 +266,11 @@ if TASK_ID >= len(prefixes):
 prefix = prefixes[TASK_ID]
 logger.info(f"Processing prefix {prefix} (index {TASK_ID} of {len(prefixes)})")
 
-target_table_name = f"co_tmp_hashes_{prefix}"
-PROD_TABLE = "ndb.colabfit-prod.prod.co_with_hashes"
+target_table_name = f"co_tmp_hashes_{prefix}n3"
+cs_co_map_tmp_table_name = f"cs_co_map_tmp_{prefix}"
+PROD_TABLE = "ndb.colabfit-prod.prod.co_with_hashes2"
 CS_CO_MAP_TABLE = "ndb.colabfit-prod.prod.cs_co_map"
-NEW_CS_CO_MAP_TABLE = "ndb.colabfit-prod.prod.new_cs_co_map"
+NEW_CS_CO_MAP_TABLE = "ndb.colabfit-prod.prod.new_cs_co_map2"
 
 try:
     with get_session().transaction() as tx:
@@ -277,12 +278,14 @@ try:
         if sch.table(target_table_name, fail_if_missing=False):
             sch.table(target_table_name).drop()
             logger.info(f"Dropped existing temporary table {target_table_name}.")
-        if TASK_ID == 0:
-            cs_co_schema = sch.table(
-                CS_CO_MAP_TABLE.split(".")[-1]
-            ).arrow_schema.append(pa.field("new_configuration_id", pa.string()))
-            sch.create_table(NEW_CS_CO_MAP_TABLE.split(".")[-1], columns=cs_co_schema)
-            logger.info(f"Created {NEW_CS_CO_MAP_TABLE.split('.')[-1]}")
+        if sch.table(cs_co_map_tmp_table_name, fail_if_missing=False):
+            sch.table(cs_co_map_tmp_table_name).drop()
+            logger.info(f"Dropped existing temporary table {cs_co_map_tmp_table_name}.")
+        cs_co_schema = sch.table(CS_CO_MAP_TABLE.split(".")[-1]).arrow_schema.append(
+            pa.field("new_configuration_id", pa.string())
+        )
+        sch.create_table(cs_co_map_tmp_table_name, columns=cs_co_schema)
+        logger.info(f"Created temporary table {cs_co_map_tmp_table_name}")
 
     with get_session().transaction() as tx:
         logger.info("Transaction started")
@@ -322,12 +325,12 @@ try:
                 f"Wrote {table_with_hashes.num_rows} rows to {target_table_name}"
             )
 
-            # Update the cs_co_map table
+            # Update the temporary cs_co_map table
             update_cs_co_map(
                 tx,
                 table_with_hashes,
                 CS_CO_MAP_TABLE.split(".")[-1],
-                NEW_CS_CO_MAP_TABLE.split(".")[-1],
+                cs_co_map_tmp_table_name,
             )
 
         if batch_count == 0:
@@ -337,8 +340,13 @@ try:
 
     if batch_count == 0:
         logger.info("Nothing to append; exiting.")
+        with get_session().transaction() as tx:
+            tx.bucket("colabfit-prod").schema("prod").table(
+                cs_co_map_tmp_table_name
+            ).drop()
+        logger.info(f"Dropped empty temporary table {cs_co_map_tmp_table_name}")
     else:
-        logger.info(f"Appending {prefix} to production table")
+        logger.info(f"Appending {prefix} to production tables")
         if TASK_ID == 0:
             with get_session().transaction() as tx:
                 sch = tx.bucket("colabfit-prod").schema("prod")
@@ -346,12 +354,23 @@ try:
                     PROD_TABLE.split(".")[-1],
                     columns=table_with_hashes.schema,
                 )
+                sch.create_table(
+                    NEW_CS_CO_MAP_TABLE.split(".")[-1],
+                    columns=cs_co_schema,
+                )
 
         append_wip_to_prod(f"ndb.colabfit-prod.prod.{target_table_name}", PROD_TABLE)
+        append_wip_to_prod(
+            f"ndb.colabfit-prod.prod.{cs_co_map_tmp_table_name}", NEW_CS_CO_MAP_TABLE
+        )
 
         with get_session().transaction() as tx:
-            tx.bucket("colabfit-prod").schema("prod").table(target_table_name).drop()
-        logger.info(f"Dropped temporary table {target_table_name}")
+            sch = tx.bucket("colabfit-prod").schema("prod")
+            sch.table(target_table_name).drop()
+            sch.table(cs_co_map_tmp_table_name).drop()
+        logger.info(
+            f"Dropped temporary tables {target_table_name} and {cs_co_map_tmp_table_name}"
+        )
         logger.info("Complete!")
 
 except Exception as e:
