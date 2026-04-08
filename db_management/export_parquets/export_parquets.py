@@ -46,88 +46,88 @@ CONFIG = {
 }
 
 
-BOTO_CLIENT_CONFIG = BotoConfig(
-    signature_version="s3v4",
-    s3={"addressing_style": "path"},
-    max_pool_connections=CONFIG["S3_MAX_POOL_CONNECTIONS"],
-    read_timeout=CONFIG["S3_READ_TIMEOUT"],
-    connect_timeout=CONFIG["S3_CONNECT_TIMEOUT"],
-    retries={"max_attempts": CONFIG["S3_MAX_ATTEMPTS"], "mode": "standard"},
-)
+# BOTO_CLIENT_CONFIG = BotoConfig(
+#     signature_version="s3v4",
+#     s3={"addressing_style": "path"},
+#     max_pool_connections=CONFIG["S3_MAX_POOL_CONNECTIONS"],
+#     read_timeout=CONFIG["S3_READ_TIMEOUT"],
+#     connect_timeout=CONFIG["S3_CONNECT_TIMEOUT"],
+#     retries={"max_attempts": CONFIG["S3_MAX_ATTEMPTS"], "mode": "standard"},
+# )
 
 
-class S3FileManager:
-    CACHE_MAX = CONFIG["S3_CACHE_SIZE"]
-    CACHE_LOCK = threading.Lock()
-    CACHE = OrderedDict()
+# class S3FileManager:
+#     CACHE_MAX = CONFIG["S3_CACHE_SIZE"]
+#     CACHE_LOCK = threading.Lock()
+#     CACHE = OrderedDict()
 
-    def __init__(self, bucket_name, access_id, secret_key, endpoint_url=None):
-        self.bucket_name = bucket_name
-        self.access_id = access_id
-        self.secret_key = secret_key
-        self.endpoint_url = endpoint_url
-        self._client = self._create_client()
+#     def __init__(self, bucket_name, access_id, secret_key, endpoint_url=None):
+#         self.bucket_name = bucket_name
+#         self.access_id = access_id
+#         self.secret_key = secret_key
+#         self.endpoint_url = endpoint_url
+#         self._client = self._create_client()
 
-    def _create_client(self):
-        return boto3.client(
-            "s3",
-            use_ssl=False,
-            endpoint_url=self.endpoint_url,
-            aws_access_key_id=self.access_id,
-            aws_secret_access_key=self.secret_key,
-            region_name="fake-region",
-            config=BOTO_CLIENT_CONFIG,
-        )
+#     def _create_client(self):
+#         return boto3.client(
+#             "s3",
+#             use_ssl=False,
+#             endpoint_url=self.endpoint_url,
+#             aws_access_key_id=self.access_id,
+#             aws_secret_access_key=self.secret_key,
+#             region_name="fake-region",
+#             config=BOTO_CLIENT_CONFIG,
+#         )
 
-    def get_client(self):
-        return self._client
+#     def get_client(self):
+#         return self._client
 
-    def write_file(self, content, file_key):
-        try:
-            self._client.put_object(Bucket=self.bucket_name, Key=file_key, Body=content)
-        except Exception as e:
-            return f"Error: {str(e)}"
+#     def write_file(self, content, file_key):
+#         try:
+#             self._client.put_object(Bucket=self.bucket_name, Key=file_key, Body=content)
+#         except Exception as e:
+#             return f"Error: {str(e)}"
 
-    def read_file(self, file_key):
-        cache_key = (self.bucket_name, file_key)
-        if S3FileManager.CACHE_MAX:
-            with S3FileManager.CACHE_LOCK:
-                cached = S3FileManager.CACHE.get(cache_key)
-                if cached is not None:
-                    S3FileManager.CACHE.move_to_end(cache_key)
-                    return cached
+#     def read_file(self, file_key):
+#         cache_key = (self.bucket_name, file_key)
+#         if S3FileManager.CACHE_MAX:
+#             with S3FileManager.CACHE_LOCK:
+#                 cached = S3FileManager.CACHE.get(cache_key)
+#                 if cached is not None:
+#                     S3FileManager.CACHE.move_to_end(cache_key)
+#                     return cached
 
-        response = self._client.get_object(Bucket=self.bucket_name, Key=file_key)
-        content = response["Body"].read().decode("utf-8")
+#         response = self._client.get_object(Bucket=self.bucket_name, Key=file_key)
+#         content = response["Body"].read().decode("utf-8")
 
-        if S3FileManager.CACHE_MAX:
-            with S3FileManager.CACHE_LOCK:
-                S3FileManager.CACHE[cache_key] = content
-                if len(S3FileManager.CACHE) > S3FileManager.CACHE_MAX:
-                    S3FileManager.CACHE.popitem(last=False)
+#         if S3FileManager.CACHE_MAX:
+#             with S3FileManager.CACHE_LOCK:
+#                 S3FileManager.CACHE[cache_key] = content
+#                 if len(S3FileManager.CACHE) > S3FileManager.CACHE_MAX:
+#                     S3FileManager.CACHE.popitem(last=False)
 
-        return content
-
-
-@lru_cache(maxsize=1)
-def _load_s3_credentials():
-    endpoint = "http://10.32.38.210"
-    user_home = f"/home/{os.environ['USER']}"
-    with open(f"{user_home}/.vast-dev/access_key_id", "r") as f:
-        access_key = f.read().rstrip("\n")
-    with open(f"{user_home}/.vast-dev/secret_access_key", "r") as f:
-        secret_key = f.read().rstrip("\n")
-    return endpoint, access_key, secret_key
+#         return content
 
 
-def get_s3_file_manager():
-    endpoint, access_key, secret_key = _load_s3_credentials()
-    return S3FileManager(
-        bucket_name="colabfit-data",
-        access_id=access_key,
-        secret_key=secret_key,
-        endpoint_url=endpoint,
-    )
+# @lru_cache(maxsize=1)
+# def _load_s3_credentials():
+#     endpoint = "http://10.32.38.210"
+#     user_home = f"/home/{os.environ['USER']}"
+#     with open(f"{user_home}/.vast-dev/access_key_id", "r") as f:
+#         access_key = f.read().rstrip("\n")
+#     with open(f"{user_home}/.vast-dev/secret_access_key", "r") as f:
+#         secret_key = f.read().rstrip("\n")
+#     return endpoint, access_key, secret_key
+
+
+# def get_s3_file_manager():
+#     endpoint, access_key, secret_key = _load_s3_credentials()
+#     return S3FileManager(
+#         bucket_name="colabfit-data",
+#         access_id=access_key,
+#         secret_key=secret_key,
+#         endpoint_url=endpoint,
+#     )
 
 
 def write_parquet_file(table, output_path, compression_level=None):
@@ -143,87 +143,82 @@ def write_parquet_file(table, output_path, compression_level=None):
 
 
 def read_metadata_column(table: pa.Table):
-    prop_paths = table["property_metadata_path"].to_pylist()
-    config_paths = table["configuration_metadata_path"].to_pylist()
-    max_workers = CONFIG["MAX_WORKERS"]
+    #     prop_paths = table["property_metadata_path"].to_pylist()
+    #     config_paths = table["configuration_metadata_path"].to_pylist()
+    #     max_workers = CONFIG["MAX_WORKERS"]
 
-    def safe_read(path, s3_mgr):
-        if path is None:
-            return None
+    #     def safe_read(path, s3_mgr):
+    #         if path is None:
+    #             return None
 
-        retries = CONFIG["S3_MAX_ATTEMPTS"]
-        delay = CONFIG["S3_BACKOFF_BASE"]
-        max_delay = CONFIG["S3_BACKOFF_MAX"]
-        last_exc = None
+    #         retries = CONFIG["S3_MAX_ATTEMPTS"]
+    #         delay = CONFIG["S3_BACKOFF_BASE"]
+    #         max_delay = CONFIG["S3_BACKOFF_MAX"]
+    #         last_exc = None
 
-        for attempt in range(1, retries + 1):
-            try:
-                return s3_mgr.read_file(path)
-            except Exception as exc:
-                last_exc = exc
-                if attempt < retries:
-                    sleep(delay)
-                    delay = min(delay * 2, max_delay)
-                else:
-                    logger.error(
-                        "Failed to read metadata from %s after %s attempts",
-                        path,
-                        retries,
-                    )
-        raise last_exc
+    #         for attempt in range(1, retries + 1):
+    #             try:
+    #                 return s3_mgr.read_file(path)
+    #             except Exception as exc:
+    #                 last_exc = exc
+    #                 if attempt < retries:
+    #                     sleep(delay)
+    #                     delay = min(delay * 2, max_delay)
+    #                 else:
+    #                     logger.error(
+    #                         "Failed to read metadata from %s after %s attempts",
+    #                         path,
+    #                         retries,
+    #                     )
+    #         raise last_exc
 
-    prop_unique = list({p for p in prop_paths if p is not None})
-    config_unique = list({c for c in config_paths if c is not None})
-    all_unique_paths = prop_unique + config_unique
-    logger.info(f"Found {len(all_unique_paths)} distinct metadata paths to read")
+    #     prop_unique = list({p for p in prop_paths if p is not None})
+    #     config_unique = list({c for c in config_paths if c is not None})
+    #     all_unique_paths = prop_unique + config_unique
+    #     logger.info(f"Found {len(all_unique_paths)} distinct metadata paths to read")
 
     start_md = time()
-    if not all_unique_paths:
-        prop_metadata_list = [None] * len(prop_paths)
-        config_metadata_list = [None] * len(config_paths)
-    else:
-        max_workers = min(max_workers, len(all_unique_paths)) or 1
-        s3s = [get_s3_file_manager() for _ in range(max_workers)]
-        path_to_content = {}
+    #     if not all_unique_paths:
+    #         prop_metadata_list = [None] * len(prop_paths)
+    #         config_metadata_list = [None] * len(config_paths)
+    #     else:
+    #         max_workers = min(max_workers, len(all_unique_paths)) or 1
+    #         s3s = [get_s3_file_manager() for _ in range(max_workers)]
+    #         path_to_content = {}
 
-        with ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix="s3-md"
-        ) as executor:
-            future_to_path = {
-                executor.submit(
-                    safe_read,
-                    path,
-                    s3s[index % max_workers],
-                ): path
-                for index, path in enumerate(all_unique_paths)
-            }
+    #         with ThreadPoolExecutor(
+    #             max_workers=max_workers, thread_name_prefix="s3-md"
+    #         ) as executor:
+    #             future_to_path = {
+    #                 executor.submit(
+    #                     safe_read,
+    #                     path,
+    #                     s3s[index % max_workers],
+    #                 ): path
+    #                 for index, path in enumerate(all_unique_paths)
+    #             }
 
-            for future in as_completed(future_to_path):
-                path = future_to_path[future]
-                try:
-                    path_to_content[path] = future.result()
-                except Exception as exc:
-                    path_to_content[path] = f"Error: {str(exc)}"
+    #             for future in as_completed(future_to_path):
+    #                 path = future_to_path[future]
+    #                 try:
+    #                     path_to_content[path] = future.result()
+    #                 except Exception as exc:
+    #                     path_to_content[path] = f"Error: {str(exc)}"
 
-        prop_metadata_list = [
-            path_to_content.get(p) if p is not None else None for p in prop_paths
-        ]
-        config_metadata_list = [
-            path_to_content.get(c) if c is not None else None for c in config_paths
-        ]
+    metadata_list = pa.array([None for p in range(table.num_rows)]).cast("string")
 
-    end_md = time()
-    logger.info(f"Metadata read completed in {end_md - start_md:.2f} seconds")
+    #     end_md = time()
+    #     logger.info(f"Metadata read completed in {end_md - start_md:.2f} seconds")
 
-    prop_metadata_array = pa.array(prop_metadata_list).cast("string")
-    config_metadata_array = pa.array(config_metadata_list).cast("string")
+    #     prop_metadata_array = pa.array(prop_metadata_list).cast("string")
+    #     config_metadata_array = pa.array(config_metadata_list).cast("string")
 
     table = table.append_column(
         pa.field("configuration_metadata", pa.string(), nullable=True),
-        config_metadata_array,
+        metadata_list,
     )
     table = table.append_column(
-        pa.field("property_metadata", pa.string(), nullable=True), prop_metadata_array
+        pa.field("property_metadata", pa.string(), nullable=True), metadata_list
     )
     logger.info(f"MD ops finished in {time() - start_md:.2f} seconds")
     return table
@@ -649,6 +644,17 @@ def get_dataset_data(dataset_id, session):
     return ds_data
 
 
+def check_table_exists(session, table_name):
+    with session.transaction() as tx:
+        exists = (
+            tx.bucket("colabfit-prod")
+            .schema("prod")
+            .table(table_name, fail_if_missing=False)
+        )
+        if exists is not None:
+            return True
+
+
 def write_dataset_parquet(ds_data, dataset_dir):
     if ds_data.num_rows > 0:
         ds_output_path = dataset_dir / "ds.parquet"
@@ -656,7 +662,7 @@ def write_dataset_parquet(ds_data, dataset_dir):
         logger.info(f"Saved DS data to: {ds_output_path}")
 
 
-def process_datasets_from_file(id_file, index):
+def process_dataset(dataset_id):
     """
     Process multiple datasets from a file containing dataset IDs
 
@@ -664,64 +670,63 @@ def process_datasets_from_file(id_file, index):
         id_file: Path to file containing dataset IDs (one per line)
         output_dir: Directory to save the parquet files
     """
-    logger.info(f"Processing datasets from file: {id_file}")
+    logger.info(f"Processing dataset: {dataset_id}")
     start = time()
     output_dir = Path().cwd()
-    with open(id_file, "r") as f:
-        dataset_ids = [line.strip() for line in f.readlines() if line.strip()][index:]
 
-    logger.info(f"Found {len(dataset_ids)} datasets to process")
-
-    for i, dataset_id in enumerate(dataset_ids, 1):
-        logger.info(f"Processing dataset {i}/{len(dataset_ids)}: {dataset_id}")
-        try:
-            dataset_dir = Path(output_dir) / dataset_id
-            if (dataset_dir / "ds.parquet").exists():
-                logger.info(f"Dataset {dataset_id} already exported, skipping")
-                continue
-            possible_tar_file = Path("tarfiles") / f"{dataset_id}.tar.gz"
-            if possible_tar_file.exists():
-                logger.info(f"Dataset {dataset_id} tar file already exists, skipping")
-                continue
-            dataset_dir.mkdir(parents=True, exist_ok=True)
-            session = get_vastdb_session()
-            ds_data = get_dataset_data(dataset_id, session)
-            nconfigs = ds_data.column("nconfigurations")[0].as_py()
-            if nconfigs > CONFIG["LARGE_DATASET_THRESHOLD"]:
-                logger.info(
-                    f"Dataset {dataset_id} has {nconfigs} configurations. "
-                    "Using batches."
-                )
-                export_configurations_in_batches(dataset_id, dataset_dir, session)
-                logger.info(
-                    "Completed CO export in batches. Moving all CO files to co/"
-                )
-                co_dir = dataset_dir / "co"
-                co_batch_paths = sorted(list(co_dir.rglob("*.parquet")))
-                for batch_path in co_batch_paths:
-                    final_path = co_dir / batch_path.name
-                    if batch_path != final_path:
-                        batch_path.rename(final_path)
-                for subdir in co_dir.iterdir():
-                    if subdir.is_dir():
-                        try:
-                            subdir.rmdir()
-                            logger.info(f"Removed empty directory: {subdir}")
-                        except OSError as e:
-                            logger.warning(f"Could not remove directory {subdir}: {e}")
-            else:
-                logger.info(
-                    f"Dataset {dataset_id} has {nconfigs} configurations. "
-                    "Selecting all at once."
-                )
-                export_configuration_parquets(dataset_id, dataset_dir, session)
+    try:
+        dataset_dir = Path(output_dir) / dataset_id
+        if (dataset_dir / "ds.parquet").exists():
+            logger.info(f"Dataset {dataset_id} already exported, skipping")
+        possible_tar_file = Path("tarfiles") / f"{dataset_id}.tar.gz"
+        if possible_tar_file.exists():
+            logger.info(f"Dataset {dataset_id} tar file already exists, skipping")
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        session = get_vastdb_session()
+        ds_data = get_dataset_data(dataset_id, session)
+        nconfigs = ds_data.column("nconfigurations")[0].as_py()
+        if nconfigs > CONFIG["LARGE_DATASET_THRESHOLD"]:
+            logger.info(
+                f"Dataset {dataset_id} has {nconfigs} configurations. " "Using batches."
+            )
+            export_configurations_in_batches(dataset_id, dataset_dir, session)
+            logger.info("Completed CO export in batches. Moving all CO files to co/")
+            co_dir = dataset_dir / "co"
+            co_batch_paths = sorted(list(co_dir.rglob("*.parquet")))
+            for batch_path in co_batch_paths:
+                final_path = co_dir / batch_path.name
+                if batch_path != final_path:
+                    batch_path.rename(final_path)
+            for subdir in co_dir.iterdir():
+                if subdir.is_dir():
+                    try:
+                        subdir.rmdir()
+                        logger.info(f"Removed empty directory: {subdir}")
+                    except OSError as e:
+                        logger.warning(f"Could not remove directory {subdir}: {e}")
+        else:
+            logger.info(
+                f"Dataset {dataset_id} has {nconfigs} configurations. "
+                "Selecting all at once."
+            )
+            export_configuration_parquets(dataset_id, dataset_dir, session)
+        cs_ids_all = []
+        if check_table_exists(session, "configuration_set_arrays"):
             cs_ids_all = export_configuration_sets(dataset_id, dataset_dir, session)
-            if cs_ids_all:
-                export_cs_co_mapping(cs_ids_all, dataset_dir, session)
-            write_dataset_parquet(ds_data, dataset_dir)
-        except Exception as e:
-            logger.error(f"Error processing dataset {dataset_id}: {str(e)}")
-            continue
+        else:
+            logger.info(
+                f"Table configuration_set_arrays does not exist, skipping CS export"
+            )
+
+        if cs_ids_all and check_table_exists(session, "cs_co_map"):
+            export_cs_co_mapping(cs_ids_all, dataset_dir, session)
+        elif cs_ids_all:
+            logger.info(
+                f"Table cs_co_map does not exist, " "skipping CS-CO mapping export"
+            )
+        write_dataset_parquet(ds_data, dataset_dir)
+    except Exception as e:
+        logger.error(f"Error processing dataset {dataset_id}: {str(e)}")
     logger.info(
         f"Export completed for dataset {dataset_id} in {time() - start:.2f} seconds"
     )
@@ -729,14 +734,8 @@ def process_datasets_from_file(id_file, index):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python export_parquets_sdk.py <dataset_id_or_file> <index>")
-        print(
-            "  dataset_id_or_file: Single dataset ID or path to file with "
-            "dataset IDs"
-        )
+        print("Usage: python export_parquets_sdk.py <dataset_id>")
         sys.exit(1)
 
-    input_arg = sys.argv[1]
-    index = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-    if Path(input_arg).is_file():
-        process_datasets_from_file(input_arg, index)
+    ds_id = sys.argv[1]
+    process_dataset(ds_id)
