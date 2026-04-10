@@ -173,7 +173,7 @@ def write_dataset_readme(dataset_dir, ds_row, cs_exists):
 def main():
     token = os.getenv("HF_TOKEN")
     datasets_dir = Path(
-        "/scratch/gw2338/vast/data-lake-main/spark/scripts/huggingface_export"  # noqa E501
+        "/scratch/gw2338/export_parquet/already_tarred"  # noqa E501
     )
     dss = sorted(
         [x for x in datasets_dir.glob("DS_*") if not str(x).endswith(".tar.gz")]
@@ -215,7 +215,8 @@ def main():
             # break
         cs_dir = local_dir / "cs"
         cs_exists = cs_dir.exists() and any(cs_dir.glob("*.parquet"))
-        write_dataset_readme(local_dir, ds_info.to_pylist()[0], cs_exists)
+        if not (local_dir / "README.md").exists():
+            write_dataset_readme(local_dir, ds_info.to_pylist()[0], cs_exists)
         logger.info(f"Uploading to {repo_id}")
         repo_exists = api.repo_exists(repo_id=repo_id, repo_type="dataset")
         if not repo_exists:
