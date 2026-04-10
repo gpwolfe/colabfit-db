@@ -1,25 +1,15 @@
 import logging
-import math
+import numbers
 import os
 import sys
-import threading
-from ast import literal_eval
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
-from pathlib import Path
-from time import sleep, time
 
-import boto3
+from ast import literal_eval
+from pathlib import Path
+from time import time
+
 import pyarrow as pa
 import vastdb
-from botocore.config import Config as BotoConfig
-from colabfit.tools.vast.schema import (
-    config_prop_schema,
-    configuration_set_schema,
-    dataset_schema,
-)
-from colabfit.tools.vast.utils import spark_schema_to_arrow_schema
+
 from dotenv import load_dotenv
 from ibis import _
 
@@ -29,105 +19,13 @@ logger = logging.getLogger(__name__)
 logger.setLevel("INFO")
 
 CONFIG = {
-    "MAX_WORKERS": 96,
     "CO_BATCH_SIZE": 100_000,
     "CS_BATCH_SIZE": 100_000,
     "FILE_ROW_LIMIT": 500_000,
     "CSCO_BATCH_SIZE": 10_000,
     "COMPRESSION_LEVEL": 18,
     "LARGE_DATASET_THRESHOLD": 5_000_000,
-    "S3_CACHE_SIZE": 4096,
-    "S3_CONNECT_TIMEOUT": 5,
-    "S3_READ_TIMEOUT": 60,
-    "S3_MAX_ATTEMPTS": 8,
-    "S3_MAX_POOL_CONNECTIONS": 256,
-    "S3_BACKOFF_BASE": 0.05,
-    "S3_BACKOFF_MAX": 2.0,
 }
-
-
-# BOTO_CLIENT_CONFIG = BotoConfig(
-#     signature_version="s3v4",
-#     s3={"addressing_style": "path"},
-#     max_pool_connections=CONFIG["S3_MAX_POOL_CONNECTIONS"],
-#     read_timeout=CONFIG["S3_READ_TIMEOUT"],
-#     connect_timeout=CONFIG["S3_CONNECT_TIMEOUT"],
-#     retries={"max_attempts": CONFIG["S3_MAX_ATTEMPTS"], "mode": "standard"},
-# )
-
-
-# class S3FileManager:
-#     CACHE_MAX = CONFIG["S3_CACHE_SIZE"]
-#     CACHE_LOCK = threading.Lock()
-#     CACHE = OrderedDict()
-
-#     def __init__(self, bucket_name, access_id, secret_key, endpoint_url=None):
-#         self.bucket_name = bucket_name
-#         self.access_id = access_id
-#         self.secret_key = secret_key
-#         self.endpoint_url = endpoint_url
-#         self._client = self._create_client()
-
-#     def _create_client(self):
-#         return boto3.client(
-#             "s3",
-#             use_ssl=False,
-#             endpoint_url=self.endpoint_url,
-#             aws_access_key_id=self.access_id,
-#             aws_secret_access_key=self.secret_key,
-#             region_name="fake-region",
-#             config=BOTO_CLIENT_CONFIG,
-#         )
-
-#     def get_client(self):
-#         return self._client
-
-#     def write_file(self, content, file_key):
-#         try:
-#             self._client.put_object(Bucket=self.bucket_name, Key=file_key, Body=content)
-#         except Exception as e:
-#             return f"Error: {str(e)}"
-
-#     def read_file(self, file_key):
-#         cache_key = (self.bucket_name, file_key)
-#         if S3FileManager.CACHE_MAX:
-#             with S3FileManager.CACHE_LOCK:
-#                 cached = S3FileManager.CACHE.get(cache_key)
-#                 if cached is not None:
-#                     S3FileManager.CACHE.move_to_end(cache_key)
-#                     return cached
-
-#         response = self._client.get_object(Bucket=self.bucket_name, Key=file_key)
-#         content = response["Body"].read().decode("utf-8")
-
-#         if S3FileManager.CACHE_MAX:
-#             with S3FileManager.CACHE_LOCK:
-#                 S3FileManager.CACHE[cache_key] = content
-#                 if len(S3FileManager.CACHE) > S3FileManager.CACHE_MAX:
-#                     S3FileManager.CACHE.popitem(last=False)
-
-#         return content
-
-
-# @lru_cache(maxsize=1)
-# def _load_s3_credentials():
-#     endpoint = "http://10.32.38.210"
-#     user_home = f"/home/{os.environ['USER']}"
-#     with open(f"{user_home}/.vast-dev/access_key_id", "r") as f:
-#         access_key = f.read().rstrip("\n")
-#     with open(f"{user_home}/.vast-dev/secret_access_key", "r") as f:
-#         secret_key = f.read().rstrip("\n")
-#     return endpoint, access_key, secret_key
-
-
-# def get_s3_file_manager():
-#     endpoint, access_key, secret_key = _load_s3_credentials()
-#     return S3FileManager(
-#         bucket_name="colabfit-data",
-#         access_id=access_key,
-#         secret_key=secret_key,
-#         endpoint_url=endpoint,
-#     )
 
 
 def write_parquet_file(table, output_path, compression_level=None):
@@ -140,88 +38,6 @@ def write_parquet_file(table, output_path, compression_level=None):
         compression_level=compression_level,
     ) as writer:
         writer.write_table(table)
-
-
-def read_metadata_column(table: pa.Table):
-    #     prop_paths = table["property_metadata_path"].to_pylist()
-    #     config_paths = table["configuration_metadata_path"].to_pylist()
-    #     max_workers = CONFIG["MAX_WORKERS"]
-
-    #     def safe_read(path, s3_mgr):
-    #         if path is None:
-    #             return None
-
-    #         retries = CONFIG["S3_MAX_ATTEMPTS"]
-    #         delay = CONFIG["S3_BACKOFF_BASE"]
-    #         max_delay = CONFIG["S3_BACKOFF_MAX"]
-    #         last_exc = None
-
-    #         for attempt in range(1, retries + 1):
-    #             try:
-    #                 return s3_mgr.read_file(path)
-    #             except Exception as exc:
-    #                 last_exc = exc
-    #                 if attempt < retries:
-    #                     sleep(delay)
-    #                     delay = min(delay * 2, max_delay)
-    #                 else:
-    #                     logger.error(
-    #                         "Failed to read metadata from %s after %s attempts",
-    #                         path,
-    #                         retries,
-    #                     )
-    #         raise last_exc
-
-    #     prop_unique = list({p for p in prop_paths if p is not None})
-    #     config_unique = list({c for c in config_paths if c is not None})
-    #     all_unique_paths = prop_unique + config_unique
-    #     logger.info(f"Found {len(all_unique_paths)} distinct metadata paths to read")
-
-    start_md = time()
-    #     if not all_unique_paths:
-    #         prop_metadata_list = [None] * len(prop_paths)
-    #         config_metadata_list = [None] * len(config_paths)
-    #     else:
-    #         max_workers = min(max_workers, len(all_unique_paths)) or 1
-    #         s3s = [get_s3_file_manager() for _ in range(max_workers)]
-    #         path_to_content = {}
-
-    #         with ThreadPoolExecutor(
-    #             max_workers=max_workers, thread_name_prefix="s3-md"
-    #         ) as executor:
-    #             future_to_path = {
-    #                 executor.submit(
-    #                     safe_read,
-    #                     path,
-    #                     s3s[index % max_workers],
-    #                 ): path
-    #                 for index, path in enumerate(all_unique_paths)
-    #             }
-
-    #             for future in as_completed(future_to_path):
-    #                 path = future_to_path[future]
-    #                 try:
-    #                     path_to_content[path] = future.result()
-    #                 except Exception as exc:
-    #                     path_to_content[path] = f"Error: {str(exc)}"
-
-    metadata_list = pa.array([None for p in range(table.num_rows)]).cast("string")
-
-    #     end_md = time()
-    #     logger.info(f"Metadata read completed in {end_md - start_md:.2f} seconds")
-
-    #     prop_metadata_array = pa.array(prop_metadata_list).cast("string")
-    #     config_metadata_array = pa.array(config_metadata_list).cast("string")
-
-    table = table.append_column(
-        pa.field("configuration_metadata", pa.string(), nullable=True),
-        metadata_list,
-    )
-    table = table.append_column(
-        pa.field("property_metadata", pa.string(), nullable=True), metadata_list
-    )
-    logger.info(f"MD ops finished in {time() - start_md:.2f} seconds")
-    return table
 
 
 def batch_manager(data_iterator, target_batch_size=100_000):
@@ -255,138 +71,6 @@ def batch_manager(data_iterator, target_batch_size=100_000):
             f"{leftover_table.num_rows} rows"
         )
         yield leftover_table
-
-
-def str_to_arrayof_double(val):
-    """Convert string representation of array to actual array of doubles"""
-    if val is None:
-        return None
-    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
-        return literal_eval(val)
-    return val
-
-
-def str_to_arrayof_int(val):
-    """Convert string representation of array to actual array of integers"""
-    if val is None:
-        return None
-    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
-        return literal_eval(val)
-    return val
-
-
-def str_to_arrayof_str(val):
-    """Convert string representation of array to actual array of strings"""
-    if val is None:
-        return None
-    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
-        return literal_eval(val)
-    return val
-
-
-def str_to_arrayof_bool(val):
-    """Convert string representation of array to actual array of booleans"""
-    if val is None:
-        return None
-    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
-        return literal_eval(val)
-    return val
-
-
-def str_to_nestedarrayof_double(val):
-    """Convert string representation of nested array to actual nested array
-    of doubles"""
-    if val is None:
-        return None
-    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
-        try:
-            custom_globals = {"nan": math.nan}
-            return eval(val, custom_globals)
-        except (ValueError, SyntaxError) as e:
-            logger.error(f"Failed to parse nested array: {val[:100]}... Error: {e}")
-            return None
-    return val
-
-
-def str_to_nestedarrayof_int(val):
-    """Convert string representation of nested array to actual nested array
-    of integers"""
-    if val is None:
-        return None
-    if isinstance(val, str) and len(val) > 0 and val[0] == "[":
-        return literal_eval(val)
-    return val
-
-
-co_arrow_schema = spark_schema_to_arrow_schema(config_prop_schema)
-ds_arrow_schema = spark_schema_to_arrow_schema(dataset_schema)
-cs_arrow_schema = spark_schema_to_arrow_schema(configuration_set_schema)
-
-co_nested_arr_cols = [
-    field.name
-    for field in co_arrow_schema
-    if field.type == pa.list_(pa.list_(pa.float64()))
-]
-co_double_arr_cols = [
-    field.name for field in co_arrow_schema if field.type == pa.list_(pa.float64())
-]
-co_str_arr_cols = [
-    field.name for field in co_arrow_schema if field.type == pa.list_(pa.string())
-]
-co_int_arr_cols = [
-    field.name
-    for field in co_arrow_schema
-    if (field.type == pa.list_(pa.int64()) or field.type == pa.list_(pa.int32()))
-]
-co_bool_arr_cols = [
-    field.name for field in co_arrow_schema if field.type == pa.list_(pa.bool_())
-]
-
-CO_TYPE_MAP = {
-    "nested_double": co_nested_arr_cols,
-    "double_array": co_double_arr_cols,
-    "int_array": co_int_arr_cols,
-    "str_array": co_str_arr_cols,
-    "bool_array": co_bool_arr_cols,
-}
-
-
-def transform_table_arrays(table, col_type_map):
-    """Transform string columns to array columns based on type mapping"""
-    arrays = []
-    names = []
-    for col_name in table.column_names:
-        col_array = table.column(col_name)
-        names.append(col_name)
-        if col_name in col_type_map.get("nested_double", []):
-            pylist = col_array.to_pylist()
-            transformed_list = [str_to_nestedarrayof_double(val) for val in pylist]
-            nested_double_type = pa.list_(pa.list_(pa.float64()))
-            arrays.append(pa.array(transformed_list, type=nested_double_type))
-        elif col_name in col_type_map.get("double_array", []):
-            pylist = col_array.to_pylist()
-            transformed_list = [str_to_arrayof_double(val) for val in pylist]
-            arrays.append(pa.array(transformed_list, type=pa.list_(pa.float64())))
-        elif col_name in col_type_map.get("int_array", []):
-            pylist = col_array.to_pylist()
-            transformed_list = [str_to_arrayof_int(val) for val in pylist]
-            arrays.append(pa.array(transformed_list, type=pa.list_(pa.int64())))
-        elif col_name in col_type_map.get("str_array", []):
-            pylist = col_array.to_pylist()
-            transformed_list = [str_to_arrayof_str(val) for val in pylist]
-            arrays.append(pa.array(transformed_list, type=pa.list_(pa.string())))
-        elif col_name in col_type_map.get("bool_array", []):
-            pylist = col_array.to_pylist()
-            transformed_list = [str_to_arrayof_bool(val) for val in pylist]
-            arrays.append(pa.array(transformed_list, type=pa.list_(pa.bool_())))
-        elif col_name in col_type_map.get("nested_int", []):
-            pylist = col_array.to_pylist()
-            transformed_list = [str_to_nestedarrayof_int(val) for val in pylist]
-            nested_int_type = pa.list_(pa.list_(pa.int64()))
-            arrays.append(pa.array(transformed_list, type=nested_int_type))
-        else:
-            arrays.append(col_array)
-    return pa.table(arrays, names=names)
 
 
 def get_vastdb_session():
@@ -425,9 +109,7 @@ def export_configuration_parquets(dataset_id, dataset_dir, session):
 def _export_configs(predicate, co_output_path, session, initial_file_count):
 
     with session.transaction() as tx:
-        co_table = (
-            tx.bucket("colabfit-prod").schema("prod").table("co_po_merged_innerjoin")
-        )
+        co_table = tx.bucket("colabfit-prod").schema("prod").table("co")
         co_data = co_table.select(predicate=predicate)
         batch_count = 0
         file_rows = 0
@@ -448,9 +130,7 @@ def _export_configs(predicate, co_output_path, session, initial_file_count):
                 if batch_rows == 0:
                     logger.warning(f"CO batch {i} is empty, skipping")
                     continue
-                co_data_transformed = transform_table_arrays(co_batch, CO_TYPE_MAP)
-                co_data_transformed = read_metadata_column(co_data_transformed)
-                file_tables.append(co_data_transformed)
+                file_tables.append(co_batch)
 
                 if file_rows >= file_row_size:
                     file_table = pa.concat_tables(file_tables)
@@ -498,8 +178,7 @@ def export_configurations_in_batches(dataset_id, dataset_dir, session):
         co_tmp_path.mkdir(parents=True, exist_ok=True)
     total_batch_count = 0
     total_rows = 0
-    prefix_div = [f"PO_{i:03d}" for i in range(100, 140)]
-    prefix_div += [f"PO_{i:02d}" for i in range(14, 100)]
+    prefix_div = [f"PO_{c}" for c in "0123456789abcdef"]
     existing_prefix_paths = {p.name for p in co_dir.glob("PO_*")}
 
     # Find last file count from existing files
@@ -653,6 +332,8 @@ def check_table_exists(session, table_name):
         )
         if exists is not None:
             return True
+        else:
+            return False
 
 
 def write_dataset_parquet(ds_data, dataset_dir):
@@ -662,25 +343,178 @@ def write_dataset_parquet(ds_data, dataset_dir):
         logger.info(f"Saved DS data to: {ds_output_path}")
 
 
+def generate_dataset_citation_string(item):
+    def _ensure_list(value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            try:
+                return literal_eval(value)
+            except (ValueError, SyntaxError):
+                return [value]
+        return value
+
+    logger.info(f"Generating citation for dataset {item['id']}")
+    joined_names = []
+    for author in _ensure_list(item["authors"]):
+        name_parts_orig = author.split(" ")
+        name_parts_new = []
+        family_name = name_parts_orig.pop()
+        for name_part in name_parts_orig:
+            if name_part[0].islower():
+                continue
+            name_parts_new.append(name_part[0] + ".")
+        joined_names.append(family_name + ", " + " ".join(name_parts_new))
+
+    if len(joined_names) > 1:
+        joined_names[-1] = "and " + joined_names[-1]
+    joined_names_string = ", ".join(joined_names)
+    item_name_converted = item["name"].replace("_", " ")
+    return (
+        f"{joined_names_string} _{item_name_converted}_. ColabFit, "
+        f"{item['publication_year']}. https://doi.org/{item['doi']}"
+    )
+
+
+def write_dataset_readme(dataset_dir, ds_row, cs_exists):
+    def _ensure_list(value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            try:
+                return literal_eval(value)
+            except (ValueError, SyntaxError):
+                return [value]
+        return value
+
+    def _ensure_dict(value):
+        if value is None:
+            return {}
+        if isinstance(value, str):
+            try:
+                parsed = literal_eval(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except (ValueError, SyntaxError):
+                return {}
+        return value
+
+    elements = ", ".join(_ensure_list(ds_row["elements"]))
+    dslicense = ds_row["license"]
+    if dslicense.lower() == "nist-pd":
+        dslicense = "unknown"
+    if dslicense.lower() == "cc0":
+        dslicense = "cc0-1.0"
+    links = _ensure_dict(ds_row["links"])
+    properties_cols = ", ".join(
+        [
+            col.replace("_count", "").replace("_", " ")
+            for col, value in ds_row.items()
+            if col.endswith("count") and isinstance(value, numbers.Number) and value
+        ]
+    )
+    citation = generate_dataset_citation_string(ds_row)
+    dataset_name = ds_row["name"].replace("_", " ")
+
+    text = (
+        "---\n"
+        "configs:\n"
+        "- config_name: default\n"
+        '  data_files: "co/*.parquet"\n'
+        "- config_name: info\n"
+        '  data_files: "ds.parquet"\n'
+    )
+    if cs_exists:
+        text += (
+            "- config_name: configuration_sets\n"
+            '  data_files: "cs/*.parquet"\n'
+            "- config_name: config_set_mapping\n"
+            '  data_files: "cs_co_map/*.parquet"\n'
+        )
+    text += (
+        "license: {license}\n"
+        "tags:\n"
+        "- molecular dynamics\n"
+        "- mlip\n"
+        "- interatomic potential\n"
+        "pretty_name: {pretty_name}\n"
+        "---\n"
+    ).format(license=dslicense.lower().replace("-only", ""), pretty_name=dataset_name)
+
+    text += (
+        f"### <details><summary>Cite this dataset </summary>{citation}</details>  \n"
+        "#### This dataset has been curated and formatted for the ColabFit Exchange  \n"
+        "#### This dataset is also available on the ColabFit Exchange:  \n"
+        f"https://materials.colabfit.org/id/{ds_row['id']}  \n"
+        "#### Visit the ColabFit Exchange to search additional datasets by author, "
+        "description, element content and more.  \nhttps://materials.colabfit.org\n<br>"
+        "<hr>  \n"
+        f"# Dataset  Name  \n{dataset_name}  \n"
+        f"### Description  \n{ds_row['description']}  \n"
+        "### Dataset authors  \n"
+        f"{', '.join(_ensure_list(ds_row['authors']))}  \n"
+    )
+    source_publication = links.get("source-publication")
+    if source_publication:
+        text += f"### Publication  \n{source_publication}  \n"
+    source_data = links.get("source-data")
+    if source_data:
+        text += f"### Original data link  \n{source_data}  \n"
+    text += (
+        f"### License  \n{dslicense}  \n"
+        "### Number of unique molecular configurations  \n"
+        f"{ds_row['nconfigurations']}  \n"
+        f"### Number of atoms  \n{ds_row['nsites']}  \n"
+        f"### Elements included  \n{elements}  \n"
+        f"### Properties included  \n{properties_cols}  \n<br>\n"
+        "<hr>  \n\n"
+        "# Usage  \n"
+        "- `ds.parquet` : Aggregated dataset information.  \n"
+        "- `co/` directory: Configuration rows each include a structure, calculated "
+        "properties, and metadata.  \n"
+        "- `cs/` directory : Configuration sets are subsets of configurations grouped "
+        "by some common characteristic. If `cs/` does not exist, no configurations sets "
+        "have been defined for this dataset.  \n"
+        "- `cs_co_map/` directory : The mapping of configurations to configuration sets "
+        "(if defined).  \n<br>\n"
+        "#### ColabFit Exchange documentation includes descriptions of content and "
+        "example code for parsing parquet files:  \n"
+        "- [Parquet parsing: example code]"
+        "(https://materials.colabfit.org/docs/how_to_use_parquet)  \n"
+        "- [Dataset info schema]"
+        "(https://materials.colabfit.org/docs/dataset_schema)  \n"
+        "- [Configuration schema]"
+        "(https://materials.colabfit.org/docs/configuration_schema)  \n"
+        "- [Configuration set schema]"
+        "(https://materials.colabfit.org/docs/configuration_set_schema)  \n"
+        "- [Configuration set to configuration mapping schema]"
+        "(https://materials.colabfit.org/docs/cs_co_mapping_schema)  \n"
+    )
+
+    with open(dataset_dir / "README.md", "w") as f:
+        f.write(text)
+    logger.info("README written")
+
+
 def process_dataset(dataset_id):
     """
-    Process multiple datasets from a file containing dataset IDs
+    Export parquet files for a single dataset from VastDB.
 
     Args:
-        id_file: Path to file containing dataset IDs (one per line)
-        output_dir: Directory to save the parquet files
+        dataset_id: Dataset ID string to export
     """
     logger.info(f"Processing dataset: {dataset_id}")
     start = time()
     output_dir = Path().cwd()
 
     try:
-        dataset_dir = Path(output_dir) / dataset_id
+        dataset_dir = output_dir / dataset_id
         if (dataset_dir / "ds.parquet").exists():
             logger.info(f"Dataset {dataset_id} already exported, skipping")
+            return
         possible_tar_file = Path("tarfiles") / f"{dataset_id}.tar.gz"
         if possible_tar_file.exists():
             logger.info(f"Dataset {dataset_id} tar file already exists, skipping")
+            return
         dataset_dir.mkdir(parents=True, exist_ok=True)
         session = get_vastdb_session()
         ds_data = get_dataset_data(dataset_id, session)
@@ -690,20 +524,6 @@ def process_dataset(dataset_id):
                 f"Dataset {dataset_id} has {nconfigs} configurations. " "Using batches."
             )
             export_configurations_in_batches(dataset_id, dataset_dir, session)
-            logger.info("Completed CO export in batches. Moving all CO files to co/")
-            co_dir = dataset_dir / "co"
-            co_batch_paths = sorted(list(co_dir.rglob("*.parquet")))
-            for batch_path in co_batch_paths:
-                final_path = co_dir / batch_path.name
-                if batch_path != final_path:
-                    batch_path.rename(final_path)
-            for subdir in co_dir.iterdir():
-                if subdir.is_dir():
-                    try:
-                        subdir.rmdir()
-                        logger.info(f"Removed empty directory: {subdir}")
-                    except OSError as e:
-                        logger.warning(f"Could not remove directory {subdir}: {e}")
         else:
             logger.info(
                 f"Dataset {dataset_id} has {nconfigs} configurations. "
@@ -715,16 +535,18 @@ def process_dataset(dataset_id):
             cs_ids_all = export_configuration_sets(dataset_id, dataset_dir, session)
         else:
             logger.info(
-                f"Table configuration_set_arrays does not exist, skipping CS export"
+                "Table configuration_set_arrays does not exist, skipping CS export"
             )
 
         if cs_ids_all and check_table_exists(session, "cs_co_map"):
             export_cs_co_mapping(cs_ids_all, dataset_dir, session)
         elif cs_ids_all:
             logger.info(
-                f"Table cs_co_map does not exist, " "skipping CS-CO mapping export"
+                "Table cs_co_map does not exist, " "skipping CS-CO mapping export"
             )
         write_dataset_parquet(ds_data, dataset_dir)
+        ds_row = ds_data.to_pylist()[0]
+        write_dataset_readme(dataset_dir, ds_row, bool(cs_ids_all))
     except Exception as e:
         logger.error(f"Error processing dataset {dataset_id}: {str(e)}")
     logger.info(
@@ -734,7 +556,7 @@ def process_dataset(dataset_id):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python export_parquets_sdk.py <dataset_id>")
+        print("Usage: python export_parquets_no_md.py <dataset_id>")
         sys.exit(1)
 
     ds_id = sys.argv[1]
