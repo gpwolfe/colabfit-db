@@ -30,7 +30,8 @@ qconfig = QueryConfig(
 )
 if not access_key or not access_secret or not endpoint:
     logger.error(
-        f"Missing environment variables: access_key={bool(access_key)}, access_secret={bool(access_secret)}, endpoint={bool(endpoint)}"
+        f"Missing environment variables: access_key={bool(access_key)}, "
+        f"access_secret={bool(access_secret)}, endpoint={bool(endpoint)}"
     )
     raise ValueError("Missing required environment variables")
 

@@ -7,7 +7,6 @@ from ast import literal_eval
 from pathlib import Path
 from time import time
 
-from django import http
 import pyarrow as pa
 import vastdb
 
@@ -40,7 +39,9 @@ def _ensure_list(value):
     return value
 
 
-def write_parquet_file(table, output_path, compression_level=CONFIG["COMPRESSION_LEVEL"]):
+def write_parquet_file(
+    table, output_path, compression_level=CONFIG["COMPRESSION_LEVEL"]
+):
     with pa.parquet.ParquetWriter(
         output_path,
         table.schema,
@@ -281,7 +282,9 @@ def export_cs_co_mapping(cs_ids_all, dataset_dir, table_suffix, session):
     file_rows = 0
 
     with session.transaction() as tx:
-        cs_co_map_table = tx.bucket("colabfit").schema("dev").table(f"cs_co_map_{table_suffix}")
+        cs_co_map_table = (
+            tx.bucket("colabfit").schema("dev").table(f"cs_co_map_{table_suffix}")
+        )
 
         for i in range(0, len(cs_ids_all), batch_size):
             cs_id_batch = cs_ids_all[i : i + batch_size]  # noqa: E203
@@ -327,9 +330,7 @@ def get_dataset_data(dataset_id, table_suffix, session):
 def check_table_exists(session, table_name):
     with session.transaction() as tx:
         exists = (
-            tx.bucket("colabfit")
-            .schema("dev")
-            .table(table_name, fail_if_missing=False)
+            tx.bucket("colabfit").schema("dev").table(table_name, fail_if_missing=False)
         )
         return exists is not None
 
@@ -501,16 +502,22 @@ def process_dataset(dataset_id, table_suffix):
             logger.info(
                 f"Dataset {dataset_id} has {nconfigs} configurations. " "Using batches."
             )
-            export_configurations_in_batches(dataset_id, dataset_dir, table_suffix, session)
+            export_configurations_in_batches(
+                dataset_id, dataset_dir, table_suffix, session
+            )
         else:
             logger.info(
                 f"Dataset {dataset_id} has {nconfigs} configurations. "
                 "Selecting all at once."
             )
-            export_configuration_parquets(dataset_id, dataset_dir, table_suffix, session)
+            export_configuration_parquets(
+                dataset_id, dataset_dir, table_suffix, session
+            )
         cs_ids_all = []
         if check_table_exists(session, f"cs_{table_suffix}"):
-            cs_ids_all = export_configuration_sets(dataset_id, dataset_dir, table_suffix, session)
+            cs_ids_all = export_configuration_sets(
+                dataset_id, dataset_dir, table_suffix, session
+            )
         else:
             logger.info(
                 "Table configuration_set_arrays does not exist, skipping CS export"
