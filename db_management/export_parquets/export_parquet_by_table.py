@@ -12,11 +12,18 @@ import vastdb
 
 from dotenv import load_dotenv
 from ibis import _
+from vastdb.config import QueryConfig
 
 load_dotenv()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 logger = logging.getLogger(__name__)
-logger.setLevel("INFO")
+logger.setLevel(logging.INFO)
 
 CONFIG = {
     "CO_BATCH_SIZE": 100_000,
@@ -26,6 +33,10 @@ CONFIG = {
     "COMPRESSION_LEVEL": 18,
     "LARGE_DATASET_THRESHOLD": 5_000_000,
 }
+query_config = QueryConfig(
+    limit_rows_per_sub_split=150_000,
+    use_semi_sorted_projections=False,
+)
 
 
 def _ensure_list(value):
@@ -118,15 +129,15 @@ def export_configuration_parquets(dataset_id, dataset_dir, table_suffix, session
 def _export_configs(
     predicate, co_output_path, session, initial_file_count, table_suffix
 ):
-
     with session.transaction() as tx:
         co_table = tx.bucket("colabfit").schema("dev").table(f"co_{table_suffix}")
-        co_data = co_table.select(predicate=predicate)
+        co_data = co_table.select(predicate=predicate, config=query_config)
         batch_count = 0
         file_rows = 0
-        file_tables = []
         file_count = initial_file_count
         total_rows = 0
+        current_writer = None
+        current_output_file = None
         try:
             managed_batches = batch_manager(
                 co_data, target_batch_size=CONFIG["CO_BATCH_SIZE"]
@@ -135,31 +146,42 @@ def _export_configs(
                 batch_count += 1
                 batch_rows = co_batch.num_rows
                 total_rows += batch_rows
-                file_rows += batch_rows
                 logger.info(f"Read CO batch {i}: {batch_rows} rows")
-                file_tables.append(co_batch)
+
+                if current_writer is None:
+                    current_output_file = co_output_path / f"co_{file_count}.parquet"
+                    current_writer = pa.parquet.ParquetWriter(
+                        current_output_file,
+                        co_batch.schema,
+                        compression="zstd",
+                        compression_level=CONFIG["COMPRESSION_LEVEL"],
+                    )
+                    logger.info(f"Opened writer for {current_output_file}")
+
+                current_writer.write_table(co_batch)
+                file_rows += batch_rows
 
                 if file_rows >= CONFIG["FILE_ROW_LIMIT"]:
-                    file_table = pa.concat_tables(file_tables)
-                    file_tables = []
-                    output_file = co_output_path / f"co_{file_count}.parquet"
-                    logger.info(f"Saving CO batch {file_count} to {output_file}")
-                    write_parquet_file(
-                        file_table, output_file, CONFIG["COMPRESSION_LEVEL"]
+                    current_writer.close()
+                    logger.info(
+                        f"Saved CO file {file_count} ({file_rows} rows): "
+                        f"{current_output_file}"
                     )
-                    logger.info(f"Successfully saved CO batch {file_count}")
+                    current_writer = None
                     file_count += 1
                     file_rows = 0
-            if file_tables:
-                file_table = pa.concat_tables(file_tables)
-                file_tables = []
-                output_file = co_output_path / f"co_{file_count}.parquet"
-                logger.info(f"Saving final CO batch {file_count} to {output_file}")
-                write_parquet_file(file_table, output_file, CONFIG["COMPRESSION_LEVEL"])
-                logger.info(f"Successfully saved final CO batch {file_count}")
+
+            if current_writer is not None:
+                current_writer.close()
+                logger.info(
+                    f"Saved final CO file {file_count} ({file_rows} rows): "
+                    f"{current_output_file}"
+                )
                 file_count += 1
 
         except Exception as e:
+            if current_writer is not None:
+                current_writer.close()
             logger.error(f"Error processing CO data: {e}")
             raise
     return batch_count, file_count, total_rows
@@ -249,7 +271,9 @@ def export_configuration_sets(dataset_id, dataset_dir, table_suffix, session):
     cs_ids_all = []
     with session.transaction() as tx:
         cs_table = tx.bucket("colabfit").schema("dev").table(f"cs_{table_suffix}")
-        cs_data = cs_table.select(predicate=cs_table["dataset_id"] == dataset_id)
+        cs_data = cs_table.select(
+            predicate=cs_table["dataset_id"] == dataset_id, config=query_config
+        )
         for i, batch in enumerate(
             batch_manager(cs_data, target_batch_size=CONFIG["CS_BATCH_SIZE"])
         ):
@@ -289,7 +313,8 @@ def export_cs_co_mapping(cs_ids_all, dataset_dir, table_suffix, session):
         for i in range(0, len(cs_ids_all), batch_size):
             cs_id_batch = cs_ids_all[i : i + batch_size]  # noqa: E203
             cs_co_map_data = cs_co_map_table.select(
-                predicate=cs_co_map_table["configuration_set_id"].isin(cs_id_batch)
+                predicate=cs_co_map_table["configuration_set_id"].isin(cs_id_batch),
+                config=query_config,
             ).read_all()
 
             logger.info(f"Read CS-CO mapping batch: {cs_co_map_data.num_rows} rows")
@@ -321,7 +346,9 @@ def export_cs_co_mapping(cs_ids_all, dataset_dir, table_suffix, session):
 def get_dataset_data(dataset_id, table_suffix, session):
     with session.transaction() as tx:
         ds_table = tx.bucket("colabfit").schema("dev").table(f"ds_{table_suffix}")
-        ds_data = ds_table.select(predicate=ds_table["id"] == dataset_id)
+        ds_data = ds_table.select(
+            predicate=ds_table["id"] == dataset_id, config=query_config
+        )
         ds_data = ds_data.read_all()
         logger.info(f"Read DS rows: {ds_data.num_rows}")
     return ds_data
@@ -533,11 +560,12 @@ def process_dataset(dataset_id, table_suffix):
         write_dataset_parquet(ds_data, dataset_dir)
         ds_row = ds_data.to_pylist()[0]
         write_dataset_readme(dataset_dir, ds_row, bool(cs_ids_all))
+        logger.info(
+            f"Export completed for dataset {dataset_id} in {time() - start:.2f} seconds"
+        )
     except Exception as e:
         logger.error(f"Error processing dataset {dataset_id}: {str(e)}")
-    logger.info(
-        f"Export completed for dataset {dataset_id} in {time() - start:.2f} seconds"
-    )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
