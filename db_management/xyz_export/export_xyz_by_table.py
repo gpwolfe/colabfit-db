@@ -27,6 +27,7 @@ logger.setLevel(logging.INFO)
 
 LARGE_DATASET_THRESHOLD = 5_000_000
 BATCH_SIZE = 100_000
+FILE_ROW_LIMIT = 500_000
 
 query_config = QueryConfig(
     limit_rows_per_sub_split=150_000,
@@ -159,25 +160,47 @@ class ColabfitXYZExporter:
                 atoms.arrays["forces"] = np.array(force_val)
             yield atoms
 
-    def write_atoms_to_extxyz(self, atoms_iter, export_path):
-        # Must collect into a list: write_extxyz checks for 'move_mask' across all frames
-        atoms = list(atoms_iter)
-        with open(export_path, "w") as f:
-            write_extxyz(f, atoms)
+    def _write_configs_to_xyz(self, predicate, output_dir, initial_file_count):
+        """Fetch configs and write to extxyz, interleaving DB reads and file writes."""
+        file_count = initial_file_count
+        file_rows = 0
+        total_configs = 0
+        current_file_path = None
+        fh = None
+        try:
+            for batch in self.get_cos(predicate):
+                for atoms in self.create_atoms_from_table(batch):
+                    if fh is None:
+                        current_file_path = output_dir / f"co_{file_count}.extxyz"
+                        fh = open(current_file_path, "w")
+                        logger.info(f"Opened {current_file_path}")
+                    write_extxyz(fh, [atoms])
+                    file_rows += 1
+                    total_configs += 1
+                    if file_rows >= FILE_ROW_LIMIT:
+                        fh.close()
+                        logger.info(f"Saved {current_file_path} ({file_rows} configs)")
+                        fh = None
+                        file_count += 1
+                        file_rows = 0
+                if total_configs % 100_000 == 0 and total_configs > 0:
+                    logger.info(f"Written {total_configs} configs so far")
+            if fh is not None:
+                fh.close()
+                logger.info(f"Saved {current_file_path} ({file_rows} configs)")
+                file_count += 1
+        except Exception:
+            if fh is not None:
+                fh.close()
+            raise
+        return file_count, total_configs
 
     def export_dataset_prefix(self, predicate, prefix, co_tmp_dir, file_offset):
         """Export configurations for a single prefix into co_tmp_dir."""
         logger.info(f"Exporting prefix {prefix}")
-        total_configs = 0
-        file_count = file_offset
-        for batch in self.get_cos(predicate):
-            atoms_batch = self.create_atoms_from_table(batch)
-            export_path = co_tmp_dir / f"co_{file_count}.extxyz"
-            self.write_atoms_to_extxyz(atoms_batch, export_path)
-            total_configs += batch.num_rows
-            file_count += 1
-            if file_count % 10 == 0:
-                logger.info(f"Processed {file_count} batches ({total_configs} configs)")
+        file_count, total_configs = self._write_configs_to_xyz(
+            predicate, co_tmp_dir, file_offset
+        )
         logger.info(f"Prefix {prefix}: {total_configs} configurations exported")
         return file_count, total_configs
 
@@ -300,14 +323,7 @@ class ColabfitXYZExporter:
             co_dir = export_dir / "co"
             co_dir.mkdir(parents=True, exist_ok=True)
             predicate = _.dataset_id == dataset_id
-            total_configs = 0
-            for i, batch in enumerate(self.get_cos(predicate)):
-                atoms_batch = self.create_atoms_from_table(batch)
-                export_path = co_dir / f"co_{i}.extxyz"
-                self.write_atoms_to_extxyz(atoms_batch, export_path)
-                total_configs += batch.num_rows
-                if (i + 1) % 10 == 0:
-                    logger.info(f"Processed {i + 1} batches ({total_configs} configs)")
+            _, total_configs = self._write_configs_to_xyz(predicate, co_dir, 0)
 
         logger.info(
             f"Finished exporting {total_configs} configurations for dataset {dataset_id}"
