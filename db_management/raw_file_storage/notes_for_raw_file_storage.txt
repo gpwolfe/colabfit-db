@@ -1,0 +1,7 @@
+To find dataset ids that have original data saved to webapp pod:
+kubectl exec -it <pod_name> -- /bin/bash
+cd /xyz/original
+./find_dataset_ids.sh
+exit
+
+kubectl cp <pod_name>:/xyz/original/dataset_ids_<YYYY_MM_DD> .
